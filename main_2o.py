@@ -153,11 +153,20 @@ def main(cfg: DictConfig):
     loss_fn_img = InfoNCE(temperature=cfg.training.temperature).to(device)
     loss_fn_txt = InfoNCE(temperature=cfg.training.temperature).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.training.learning_rate)
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.get("weight_decay", 0.0) # <-- 使用 .get() 安全读取
+    )
 
     # 4. 训练循环
     print("开始训练...")
     best_val_loss = float('inf')
+    
+    #早停计时器
+    # (如果 patience 未在 config 中定义, 默认使用一个很大的数)
+    patience = cfg.training.get("patience", cfg.training.epochs) 
+    epochs_no_improve = 0
 
     for epoch in range(cfg.training.epochs):
         avg_loss, avg_loss_img, avg_loss_txt = train_one_epoch(
@@ -184,12 +193,19 @@ def main(cfg: DictConfig):
             "val_loss_text": avg_loss_val_txt
         })
 
-        # 保存最佳模型
+        # 保存最佳模型 + 早停计时器
         if avg_loss_val < best_val_loss:
             best_val_loss = avg_loss_val
             model_path = os.path.join(wandb.run.dir, "best_eeg_encoder.pth")
             torch.save(model.state_dict(), model_path)
             print(f"模型已保存到: {model_path}")
+            epochs_no_improve = 0 # 重置计数器
+        else:
+            epochs_no_improve += 1 # 增加计数器
+
+        if epochs_no_improve >= patience:
+            print(f"验证损失连续 {patience} 个 epoch 没有改善，触发 Early Stopping。")
+            break # 退出训练循环
 
     print("训练完成。")
     # 训练完成后在测试集上评估

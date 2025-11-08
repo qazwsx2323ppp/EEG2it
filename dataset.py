@@ -111,6 +111,13 @@ class TripletDataset(Dataset):
             padding_shape[-1] = target_length - current_length
             padding = torch.zeros(padding_shape, dtype=eeg_signal.dtype, device=eeg_signal.device)
             eeg_signal = torch.cat((eeg_signal, padding), dim=-1)  # 沿时间维度填充
+        
+        #仅对数据集进行数据增强
+        if self.mode == 'train':
+            # 添加少量高斯噪声
+            # 噪声的标准差 = eeg信号的标准差 * 噪声水平
+            noise = torch.randn_like(eeg_signal) * eeg_signal.std() * self.data_noise_level
+            eeg_signal = eeg_signal + noise
 
         # 4. 从字典中提取 *正确的* 图像索引 (0-1999 or potentially higher)
         main_image_index = eeg_item_dict['image']

@@ -29,7 +29,7 @@ training:
   num_workers: 4
   device: "cuda" # 'cuda' or 'cpu'
   #权重衰减
-  weight_decay: 0.01
+  weight_decay: 0.05
 
   # 损失函数权重 (alpha * loss_img + (1-alpha) * loss_txt)
   alpha: 0.5

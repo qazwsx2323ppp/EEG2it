@@ -166,6 +166,7 @@ def main(cfg: DictConfig):
     #早停计时器
     # (如果 patience 未在 config 中定义, 默认使用一个很大的数)
     patience = cfg.training.get("patience", cfg.training.epochs) 
+    min_delta = cfg.training.get("min_delta", 0.0)
     epochs_no_improve = 0
 
     for epoch in range(cfg.training.epochs):
@@ -193,8 +194,9 @@ def main(cfg: DictConfig):
             "val_loss_text": avg_loss_val_txt
         })
 
-        # 保存最佳模型 + 早停计时器
-        if avg_loss_val < best_val_loss:
+        # 保存最佳模型 + 早停计时器data11.8_1
+        # 只有当 (best_val_loss - avg_loss_val) > min_delta 时，才算作一次有效的“改善”
+        if (best_val_loss - avg_loss_val) > min_delta:
             best_val_loss = avg_loss_val
             model_path = os.path.join(wandb.run.dir, "best_eeg_encoder.pth")
             torch.save(model.state_dict(), model_path)

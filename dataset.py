@@ -16,6 +16,10 @@ class TripletDataset(Dataset):
 
     def __init__(self, cfg_data, mode='train'):
         print(f"正在加载 {mode} 数据...")
+        
+        #增加数据干data11.8_1
+        self.mode = mode 
+        self.data_noise_level = 0.02 # <-- 新增：设置噪声水平 (可调)
 
         # 1. 加载所有数据到内存
         try:

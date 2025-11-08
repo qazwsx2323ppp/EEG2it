@@ -68,7 +68,7 @@ model:
   n_filters_time: 20
   filter_time_length: 25
   #n_filters_spat: 40
-  n_filters_time: 20
+  n_filters_spat: 20
   pool_time_length: 75
   pool_time_stride: 15
   drop_prob: 0.6

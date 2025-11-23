@@ -14,7 +14,7 @@ import wandb
 from tqdm import tqdm
 
 # 导入您本地的代码
-from models.clip_models_2o import EEGEncoder, SpatialMoEEncoder, BraindecodeShallow, BraindecodeDeep
+from models.clip_models_2o import SpatialMoEEncoder, BraindecodeShallow, BraindecodeDeep
 from utils.loss_methods import InfoNCE
 from dataset_2o import TripletDataset
 

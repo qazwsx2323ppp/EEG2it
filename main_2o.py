@@ -31,6 +31,12 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
     total_loss_img = 0.0
     total_loss_txt = 0.0
 
+    # --- 【新增】 用于累计权重值 ---
+    total_weights = {
+        "w_vis_img": 0.0, "w_fus_img": 0.0, 
+        "w_sem_txt": 0.0, "w_fus_txt": 0.0
+    }
+
     for batch in tqdm(dataloader, desc="Training"):
         eeg_signals, image_vecs, text_vecs = batch
 
@@ -43,7 +49,18 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
         optimizer.zero_grad()
 
         # 前向传播
-        eeg_img_embeddings, eeg_text_embeddings = model(eeg_signals)
+        # --- 【修改】 接收三个返回值 ---
+        # 注意：这里需要兼容旧模型。如果 model 返回 2 个值，说明是旧模型；3 个值是新模型。
+        outputs = model(eeg_signals)
+        
+        if len(outputs) == 3:
+            eeg_img_embeddings, eeg_text_embeddings, weights_info = outputs
+            # 累加权重以便后续求平均
+            for k, v in weights_info.items():
+                total_weights[k] += v.item()
+        else:
+            eeg_img_embeddings, eeg_text_embeddings = outputs
+            weights_info = None
 
         # 计算损失
         loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
@@ -64,7 +81,13 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
     avg_loss_img = total_loss_img / len(dataloader)
     avg_loss_txt = total_loss_txt / len(dataloader)
 
-    return avg_loss, avg_loss_img, avg_loss_txt
+    # --- 【新增】 返回平均权重字典 ---
+    avg_weights = {}
+    if total_weights["w_vis_img"] > 0: # 确保有数据
+        for k in total_weights:
+            avg_weights[k] = total_weights[k] / len(dataloader)
+            
+    return avg_loss, avg_loss_img, avg_loss_txt, avg_weights
 
 
 def validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha):
@@ -210,7 +233,7 @@ def main(cfg: DictConfig):
     epochs_no_improve = 0
 
     for epoch in range(cfg.training.epochs):
-        avg_loss, avg_loss_img, avg_loss_txt = train_one_epoch(
+        avg_loss, avg_loss_img, avg_loss_txt, avg_weights = train_one_epoch(
             model, train_loader, optimizer, loss_fn_img, loss_fn_txt, device, cfg.training.alpha
         )
 
@@ -224,7 +247,7 @@ def main(cfg: DictConfig):
         print(f"  Train Txt Loss: {avg_loss_txt:.4f} | Val Txt Loss: {avg_loss_val_txt:.4f}")
 
         # 记录到 WandB
-        wandb.log({
+        log_dict = {
             "epoch": epoch,
             "train_loss_total": avg_loss,
             "train_loss_image": avg_loss_img,
@@ -232,7 +255,19 @@ def main(cfg: DictConfig):
             "val_loss_total": avg_loss_val,
             "val_loss_image": avg_loss_val_img,
             "val_loss_text": avg_loss_val_txt
-        })
+        }
+        # 把权重也加进去
+        if avg_weights:
+            log_dict.update(avg_weights)
+        # wandb.log({
+        #     "epoch": epoch,
+        #     "train_loss_total": avg_loss,
+        #     "train_loss_image": avg_loss_img,
+        #     "train_loss_text": avg_loss_txt,
+        #     "val_loss_total": avg_loss_val,
+        #     "val_loss_image": avg_loss_val_img,
+        #     "val_loss_text": avg_loss_val_txt
+        # })
 
         # 保存最佳模型 + 早停计时器data11.8_1
         # 只有当 (best_val_loss - avg_loss_val) > min_delta 时，才算作一次有效的“改善”
@@ -260,11 +295,8 @@ def main(cfg: DictConfig):
     print(f"Test Image Loss: {avg_loss_test_img:.4f}")
     print(f"Test Text  Loss: {avg_loss_test_txt:.4f}")
 
-    wandb.log({
-        "test_loss_total": avg_loss_test,
-        "test_loss_image": avg_loss_test_img,
-        "test_loss_text": avg_loss_test_txt
-    })
+    # 记录到 WandB
+    wandb.log(log_dict)
     wandb.finish()
 
 

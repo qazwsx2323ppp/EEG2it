@@ -14,7 +14,7 @@ import wandb
 from tqdm import tqdm
 
 # 导入您本地的代码
-from models.clip_models_2o import SpatialMoEEncoder, BraindecodeShallow, BraindecodeDeep
+from models.clip_models_2o import SpatialMoEEncoder
 from utils.loss_methods import InfoNCE
 from dataset_2o import TripletDataset
 
@@ -142,61 +142,40 @@ def main(cfg: DictConfig):
     # --- 修改 2: 初始化模型逻辑 ---
     print(f"正在初始化模型: {cfg.model.get('model_name', 'default')}")
 
-    # 检查是否使用 "eeg_moe" (分区专家模型)
-    if cfg.model.get('model_name') == 'eeg_moe':
+    
         
-        # 1. 准备基础编码器参数 (提取公共参数)
-        base_encoder_params = {
-            "n_samples": cfg.model.n_samples,
-            "n_filters_time": cfg.model.n_filters_time,
-            "filter_time_length": cfg.model.filter_time_length,
-            "n_filters_spat": cfg.model.n_filters_spat,
-            "pool_time_length": cfg.model.pool_time_length,
-            "pool_time_stride": cfg.model.pool_time_stride,
-            "n_linear_layers": cfg.model.n_linear_layers,
-            "drop_prob": cfg.model.drop_prob,
-        }
+    # # 1. 准备基础编码器参数 (提取公共参数)
+    # base_encoder_params = {
+    #     "n_samples": cfg.model.n_samples,
+    #     "n_filters_time": cfg.model.n_filters_time,
+    #     "filter_time_length": cfg.model.filter_time_length,
+    #     "n_filters_spat": cfg.model.n_filters_spat,
+    #     "pool_time_length": cfg.model.pool_time_length,
+    #     "pool_time_stride": cfg.model.pool_time_stride,
+    #     "n_linear_layers": cfg.model.n_linear_layers,
+    #     "drop_prob": cfg.model.drop_prob,
+    #     }
 
-        # 2. 确定基础类 (Shallow 还是 Deep)
-        if cfg.model.encoder_name == 'braindecode_shallow':
-            base_cls = BraindecodeShallow
-        elif cfg.model.encoder_name == 'braindecode_deep':
-            base_cls = BraindecodeDeep
-        else:
-            raise ValueError(f"未知的 encoder_name: {cfg.model.encoder_name}")
+    #     # 2. 确定基础类 (Shallow 还是 Deep)
+    # if cfg.model.encoder_name == 'braindecode_shallow':
+    #         base_cls = BraindecodeShallow
+    # elif cfg.model.encoder_name == 'braindecode_deep':
+    #         base_cls = BraindecodeDeep
+    # else:
+    #     raise ValueError(f"未知的 encoder_name: {cfg.model.encoder_name}")
 
-        # 3. 实例化 SpatialMoEEncoder
-        model = SpatialMoEEncoder(
-            n_channels=cfg.model.n_channels,
-            n_samples=cfg.model.n_samples,
-            base_encoder_cls=base_cls,
-            base_encoder_params=base_encoder_params,
-            visual_indices=cfg.model.moe_config.visual_indices,
-            semantic_indices=cfg.model.moe_config.semantic_indices,
-            embedding_dim=cfg.model.embedding_dim
-        ).to(device)
+    # 3. 实例化 SpatialMoEEncoder
+    model = SpatialMoEEncoder(
+        n_channels=cfg.model.n_channels,
+        n_samples=cfg.model.n_samples,
+        visual_indices=cfg.model.moe_config.visual_indices,
+        semantic_indices=cfg.model.moe_config.semantic_indices,
+        embedding_dim=cfg.model.embedding_dim
+    ).to(device)
         
-        print(">>> 成功初始化 Spatial MoE Encoder (分区专家模型)")
+    print(">>> 成功初始化 Spatial MoE Encoder (分区专家模型)")
 
-    else:
-        # 保持旧逻辑 (用于对比或回退)
-        model = EEGEncoder(
-            n_channels=cfg.model.n_channels,
-            n_samples=cfg.model.n_samples,
-            n_filters_time=cfg.model.n_filters_time,
-            filter_time_length=cfg.model.filter_time_length,
-            n_filters_spat=cfg.model.n_filters_spat,
-            pool_time_length=cfg.model.pool_time_length,
-            pool_time_stride=cfg.model.pool_time_stride,
-            n_linear_layers=cfg.model.n_linear_layers,
-            embedding_dim=cfg.model.embedding_dim,
-            drop_prob=cfg.model.drop_prob,
-            encoder_name=cfg.model.encoder_name,
-            channel_merge=cfg.model.get('channel_merge', None),
-            n_heads=cfg.model.get('n_heads', None)
-        ).to(device)
-        print(">>> 初始化标准 EEGEncoder")
-
+   
     # 2. 准备数据
     split_index = cfg.data.get("split_index", 0)
 
@@ -259,17 +238,9 @@ def main(cfg: DictConfig):
         # 把权重也加进去
         if avg_weights:
             log_dict.update(avg_weights)
-        # wandb.log({
-        #     "epoch": epoch,
-        #     "train_loss_total": avg_loss,
-        #     "train_loss_image": avg_loss_img,
-        #     "train_loss_text": avg_loss_txt,
-        #     "val_loss_total": avg_loss_val,
-        #     "val_loss_image": avg_loss_val_img,
-        #     "val_loss_text": avg_loss_val_txt
-        # })
 
         # 保存最佳模型 + 早停计时器data11.8_1
+
         # 只有当 (best_val_loss - avg_loss_val) > min_delta 时，才算作一次有效的“改善”
         if (best_val_loss - avg_loss_val) > min_delta:
             best_val_loss = avg_loss_val

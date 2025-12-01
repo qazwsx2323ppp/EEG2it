@@ -33,7 +33,6 @@ data/
 
 # 模型权重和检查点 (Model Checkpoints & Weights)
 # -----------------
-models/
 checkpoints/
 *.pt
 *.pth

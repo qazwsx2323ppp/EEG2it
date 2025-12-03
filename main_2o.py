@@ -462,11 +462,44 @@ def main(cfg: DictConfig):
     loss_fn_img = InfoNCE(temperature=cfg.training.temperature).to(device)
     loss_fn_txt = InfoNCE(temperature=cfg.training.temperature).to(device)
 
-    # 使用 AdamW，通常 ViT 微调需要较小的 LR，但这里通过调度器控制
+    # # 使用 AdamW，通常 ViT 微调需要较小的 LR，但这里通过调度器控制
+    # optimizer = optim.AdamW(
+    #     model.parameters(), 
+    #     lr=cfg.training.learning_rate,
+    #     weight_decay=cfg.training.get("weight_decay", 0.05)
+    # )
+
+    # 1. 将参数分组
+    backbone_params = []
+    head_params = []
+
+    for name, param in model.named_parameters():
+        if "backbone" in name:
+            backbone_params.append(param)
+        else:
+            # 包括 router, expert_heads 等
+            head_params.append(param)
+
+    # # 2. 定义优化器，给 Backbone 一个更小的学习率 (通常是主学习率的 1/10 或 1/100)
+    # optimizer = optim.AdamW(
+    #     [
+    #         # Backbone 使用非常小的学习率，小心翼翼地微调
+    #         {"params": backbone_params, "lr": cfg.training.learning_rate * 0.01}, 
+    #         # Heads 使用正常的学习率
+    #         {"params": head_params, "lr": cfg.training.learning_rate}, 
+    #     ],
+    #     weight_decay=cfg.training.get("weight_decay", 0.05)
+    # )
+
+       # 核心修改：保护你的 DreamDiffusion Backbone
     optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.get("weight_decay", 0.05)
+        [
+            # 给 Backbone 一个极小的学习率 (如 1e-6 或 5e-6)
+            {"params": backbone_params, "lr": cfg.training.learning_rate * 0.05}, 
+            # 给 Router 和 Heads 正常的学习率 (如 1e-4)
+            {"params": head_params, "lr": cfg.training.learning_rate}, 
+        ],
+           weight_decay=cfg.training.get("weight_decay", 0.05)
     )
 
     # --- 【新增】 学习率调度器 ---

@@ -48,7 +48,7 @@ model:
   model_name: 'eeg_moe'  # 更改名称以区分
   
   # [新增] Checkpoint 路径 (请修改为你存放 .pth 的真实路径)
-  pretrained_path: 'models\dreamdiffusion_pretrain'
+  pretrained_path: 'models\dreamdiffusion_pretrain\checkpoint.pth'
 
   # EEG 编码器参数
   n_linear_layers: 1

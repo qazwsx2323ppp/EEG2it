@@ -322,6 +322,9 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
 
         # 梯度清零
         optimizer.zero_grad()
+        
+        # 这里的目的是检查输入是否符合 Mean=0, Std=1 的标准
+        print(f"\n[DEBUG Check] Input Mean: {eeg_signals.mean().item():.4f}, Std: {eeg_signals.std().item():.4f}, Max: {eeg_signals.max().item():.4f}, Min: {eeg_signals.min().item():.4f}")
 
         # --- 【修改】 混合精度前向传播 ---
         with autocast():

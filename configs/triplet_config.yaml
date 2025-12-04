@@ -17,8 +17,8 @@ data:
     root: ${hydra:runtime.cwd}
     split_index: 0  # 0~5 可选
     eeg_path: ${data.root}/data/EEG_data/eeg_55_95_std.pth
-    image_vec_path: ${data.root}/data/image_vectors.npy
-    text_vec_path: ${data.root}/data/text_vectors.npy
+    image_vec_path: ${data.root}/data/image_vectors_fixed.npy
+    text_vec_path: ${data.root}/data/text_vectors_fixed.npy
     splits_path: ${data.root}/data/EEG_data/block_splits_by_image_all.pth
 
 # 4. 训练参数

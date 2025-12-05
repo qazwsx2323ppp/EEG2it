@@ -229,10 +229,12 @@ class SpatialMoEEncoder(nn.Module):
         # 5. 加权融合
         final_img_embedding = (g_vis_img * emb_vis) + (g_fus_img * emb_fus)
         final_text_embedding = (g_sem_txt * emb_sem) + (g_fus_txt * emb_fus)
-
-        # 必须进行 L2 归一化！
+    
+        # =============== 【新增】 强制 L2 归一化 ===============
+        # 这一步至关重要！将向量投射到单位球面上，这是对比学习的标准动作。
         final_img_embedding = F.normalize(final_img_embedding, p=2, dim=-1)
         final_text_embedding = F.normalize(final_text_embedding, p=2, dim=-1)
-        
-        return final_img_embedding, final_text_embedding
+        # =======================================================
+    
+        return final_img_embedding, final_text_embedding, {"w_vis_img": g_vis_img.mean(), "w_sem_txt": g_sem_txt.mean()}
 

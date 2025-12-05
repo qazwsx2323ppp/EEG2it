@@ -208,7 +208,12 @@ class MAEforEEG(nn.Module):
         # print('encoder embed')
         # print(x.shape)
         # masking: length -> length * mask_ratio
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        if mask_ratio > 0:
+            x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        else:
+            # 不做任何掩码和打乱，直接透传
+            mask = None
+            ids_restore = None
 
         # append cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]

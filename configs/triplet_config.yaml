@@ -40,7 +40,7 @@ training:
   alpha: 0.5
 
   # InfoNCE 损失函数的温度参数
-  temperature: 0.05
+  temperature: 0.1
 
 # 5. EEG 编码器模型参数
 #    这些参数来自 EEG-CLIP 仓库，您可以直接使用

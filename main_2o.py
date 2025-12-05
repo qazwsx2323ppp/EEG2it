@@ -324,7 +324,7 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
         optimizer.zero_grad()
         
         # 这里的目的是检查输入是否符合 Mean=0, Std=1 的标准
-        print(f"\n[DEBUG Check] Input Mean: {eeg_signals.mean().item():.4f}, Std: {eeg_signals.std().item():.4f}, Max: {eeg_signals.max().item():.4f}, Min: {eeg_signals.min().item():.4f}")
+        #print(f"\n[DEBUG Check] Input Mean: {eeg_signals.mean().item():.4f}, Std: {eeg_signals.std().item():.4f}, Max: {eeg_signals.max().item():.4f}, Min: {eeg_signals.min().item():.4f}")
 
         # --- 【修改】 混合精度前向传播 ---
         with autocast():
@@ -509,7 +509,7 @@ def main(cfg: DictConfig):
     # 总步数 = epoch * steps_per_epoch
     num_training_steps = cfg.training.epochs * len(train_loader)
     # 预热步数设为总步数的 10%
-    num_warmup_steps = int(0.1 * num_training_steps)
+    num_warmup_steps = int(0.01 * num_training_steps)
     
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,

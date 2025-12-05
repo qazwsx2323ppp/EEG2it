@@ -4,6 +4,7 @@ import torch
 from torch import nn
 #from braindecode.models import to_dense_prediction_model
 from models.ddpt_model import MAEforEEG
+import torch.nn.functional as F
 
 
 class SpatialMoEEncoder(nn.Module):
@@ -37,43 +38,114 @@ class SpatialMoEEncoder(nn.Module):
             embed_dim=1024,
             depth=24,
             num_heads=16,
-            decoder_embed_dim=512, 
+            decoder_embed_dim=1024, 
+            mlp_ratio=1.0,            # 新增此行！原来默认是 4.0，必须改为 1.0 以匹配 fc 层权重
             decoder_depth=8,
             decoder_num_heads=16
         )
 
+        # # 加载预训练权重
+        # if pretrained_path:
+        #     print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
+        #     # --- 【新增】 开始：伪造缺失的 config 模块 ---
+        #     import sys
+        #     import types
+
+        #     # 1. 定义一个空的伪造类
+        #     class DummyConfig:
+        #         pass
+
+        #     # 2. 创建一个伪造的模块，名字叫 'config'
+        #     dummy_config_module = types.ModuleType("config")
+            
+        #     # 3. 将伪造类挂载到伪造模块下 (类名必须完全匹配报错信息：Config_Generative_Model)
+        #     dummy_config_module.Config_Generative_Model = DummyConfig
+            
+        #     # 4. 将伪造模块注入系统，骗过 torch.load
+        #     sys.modules["config"] = dummy_config_module
+        #     # --- 【新增】 结束 ---
+
+        #     # 现在可以安全加载了 (weights_only=False 是必须的)
+        #     checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            
+        #     # 处理 checkpoint 字典结构
+        #     state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        #     # 显式允许加载 pickle 对象（因为我们要加载的 checkpoint 包含旧版 config 类）
+        #     checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+        #     state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        #     # 移除 module. 前缀
+        #     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+
         # 加载预训练权重
         if pretrained_path:
             print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
-            # --- 【新增】 开始：伪造缺失的 config 模块 ---
+            # --- 伪造 config 模块逻辑保持不变 ---
             import sys
             import types
-
-            # 1. 定义一个空的伪造类
-            class DummyConfig:
-                pass
-
-            # 2. 创建一个伪造的模块，名字叫 'config'
+            class DummyConfig: pass
             dummy_config_module = types.ModuleType("config")
-            
-            # 3. 将伪造类挂载到伪造模块下 (类名必须完全匹配报错信息：Config_Generative_Model)
             dummy_config_module.Config_Generative_Model = DummyConfig
-            
-            # 4. 将伪造模块注入系统，骗过 torch.load
             sys.modules["config"] = dummy_config_module
-            # --- 【新增】 结束 ---
+            # ----------------------------------
 
-            # 现在可以安全加载了 (weights_only=False 是必须的)
-            checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            # ... (前文的伪造 config 代码保持不变) ...
+
+        # 1. 加载文件
+        print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
+        checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+        
+        # 2. 基础拆包 (先拿到大字典)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+
+        # 3. 【核心修正】智能筛选与重命名
+        # 目标：从大模型中提取 'cond_stage_model.mae.' 开头的权重
+        new_state_dict = {}
+        target_prefix = "cond_stage_model.mae."
+        
+        print(f"正在从完整生成模型中提取 EEG Encoder 权重 (前缀: {target_prefix})...")
+        
+        for k, v in state_dict.items():
+            # 情况 A: 权重带有完整前缀 (最可能的情况)
+            if k.startswith(target_prefix):
+                new_key = k.replace(target_prefix, "")
+                new_state_dict[new_key] = v
+            # 情况 B: 万一权重已经是 mae. 开头 (以防万一)
+            elif k.startswith("mae."):
+                new_key = k.replace("mae.", "")
+                new_state_dict[new_key] = v
+                
+        # 4. 如果提取到了参数，进行加载
+        if len(new_state_dict) > 0:
+            print(f">>> 成功提取了 {len(new_state_dict)} 个 EEG Encoder 参数。")
+            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f">>> 权重加载详情: {msg}")
             
-            # 处理 checkpoint 字典结构
-            state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            # 显式允许加载 pickle 对象（因为我们要加载的 checkpoint 包含旧版 config 类）
-            checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
-            state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            # 移除 module. 前缀
-            new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-            self.backbone.load_state_dict(new_state_dict, strict=False)
+            ## --- 【修正后的检查逻辑】 ---
+            # 过滤掉所有 decoder 相关的缺失键，因为我们不需要 Decoder
+            missing_keys = [k for k in msg.missing_keys if not k.startswith('decoder_') and not k.startswith('mask_token')]
+            
+            # 打印结果
+            if len(missing_keys) > 0:
+                print(f">>> ⚠️ 注意：部分 Encoder 权重未加载 (Missing Keys): {missing_keys}")
+                # 只有当核心 Encoder 层缺失时才报严重警告
+                if any("blocks" in k for k in missing_keys) or any("patch_embed" in k for k in missing_keys):
+                    print("!!! 严重警告：核心 Encoder Block 缺失！请检查前缀！")
+                else:
+                    print(">>> (这些缺失可能不影响 Encoder 功能，如 head 等)")
+            else:
+                print(">>> ✅ 完美！所有 Encoder 核心权重均已加载！")
+
+            # 确认 Decoder 确实被忽略了
+            decoder_missing = [k for k in msg.missing_keys if k.startswith('decoder_')]
+            if len(decoder_missing) > 0:
+                print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
+
             
             # (可选) 冻结主干，只训练后面的 Router 和 Heads，节省显存
             # for param in self.backbone.parameters():
@@ -158,5 +230,9 @@ class SpatialMoEEncoder(nn.Module):
         final_img_embedding = (g_vis_img * emb_vis) + (g_fus_img * emb_fus)
         final_text_embedding = (g_sem_txt * emb_sem) + (g_fus_txt * emb_fus)
 
-        # 返回两个向量，完美适配 main_2o.py
+        # 必须进行 L2 归一化！
+        final_img_embedding = F.normalize(final_img_embedding, p=2, dim=-1)
+        final_text_embedding = F.normalize(final_text_embedding, p=2, dim=-1)
+        
         return final_img_embedding, final_text_embedding
+

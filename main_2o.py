@@ -509,7 +509,7 @@ def main(cfg: DictConfig):
     # 总步数 = epoch * steps_per_epoch
     num_training_steps = cfg.training.epochs * len(train_loader)
     # 预热步数设为总步数的 10%
-    num_warmup_steps = int(0.01 * num_training_steps)
+    num_warmup_steps = int(0.1 * num_training_steps)
     
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -529,10 +529,10 @@ def main(cfg: DictConfig):
     epochs_no_improve = 0
     
     # 设定解冻 Backbone 的 Epoch (例如第 10 个 Epoch)
-    unfreeze_epoch = 10 
+    unfreeze_epoch = 0 
     
     # --- 【新增】 初始冻结 Backbone ---
-    freeze_backbone(model, freeze=True)
+    freeze_backbone(model, freeze=False)
 
     for epoch in range(cfg.training.epochs):
         

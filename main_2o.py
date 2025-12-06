@@ -312,7 +312,7 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
         "w_sem_txt": 0.0, "w_fus_txt": 0.0
     }
 
-    for batch in tqdm(dataloader, desc="Training"):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
         eeg_signals, image_vecs, text_vecs = batch
 
         # 将数据移动到GPU
@@ -341,6 +341,26 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
                 # 兼容旧接口，防止报错
                 eeg_img_embeddings, eeg_text_embeddings = outputs
                 weights_info = None
+            
+            # === 【调试探针】请插入这段代码 ===
+            if batch_idx % 50 == 0: # 每50个batch打印一次
+                print(f"\n[DEBUG Step {batch_idx}]")
+                
+                # 1. 检查输入 EEG 是否正常 (应该 Mean≈0, Std≈1)
+                print(f"  Input EEG: Mean={eeg_signals.mean().item():.3f}, Std={eeg_signals.std().item():.3f}, Min={eeg_signals.min().item():.3f}")
+                if torch.isnan(eeg_signals).any():
+                    print("  !!! ALERT: Input EEG contains NaN!")
+    
+                # 2. 检查输出 Embedding 的模长 (如果 L2 生效，Norm 应该严格等于 1.0)
+                img_norm = eeg_img_embeddings.norm(dim=-1).mean().item()
+                txt_norm = eeg_text_embeddings.norm(dim=-1).mean().item()
+                print(f"  Output Norm: Img={img_norm:.4f}, Txt={txt_norm:.4f} (Expect 1.0)")
+                
+                # 3. 检查输出是否“死”了 (即所有样本输出都一样)
+                # 计算 Batch 内第一个样本和第二个样本的相似度。如果接近 1.0，说明模型发生了坍塌。
+                sim = torch.nn.functional.cosine_similarity(eeg_img_embeddings[0], eeg_img_embeddings[1], dim=0)
+                print(f"  Diversity Check: Sim(Batch[0], Batch[1]) = {sim.item():.4f} (接近 1.0 说明模型坍塌)")
+            # ================================
 
             # 计算损失
             loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)

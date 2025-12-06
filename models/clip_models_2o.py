@@ -190,12 +190,8 @@ class SpatialMoEEncoder(nn.Module):
         # DreamDiffusion 需要 (batch, channels, 512)
         
         # 1. 预处理：Padding 到 512
-        target_len = 512
-        if x.shape[-1] < target_len:
-            padding = torch.zeros(x.shape[0], x.shape[1], target_len - x.shape[-1], device=x.device)
-            x_padded = torch.cat([x, padding], dim=-1)
-        else:
-            x_padded = x[..., :target_len]
+        
+        x_padded = x
 
         # 2. 通过共享 Backbone 提取全局特征
         # latent shape: [batch, num_patches, 1024]

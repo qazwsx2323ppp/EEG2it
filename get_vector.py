@@ -1,116 +1,103 @@
-import os
 import torch
 import clip
-from PIL import Image
 import numpy as np
+import os
+from PIL import Image
 from tqdm import tqdm
 
 # ================= 配置区域 =================
-# 图片数据集根目录 (请修改为你服务器上的真实路径)
-# 结构应该是: IMAGE_ROOT / n02106662 / xxxx.JPEG
-IMAGE_ROOT = "data/image_data" 
+# 1. 你的 EEG 数据集路径 (必须是那个 .pth 文件)
+EEG_PATH = "data/EEG_data/eeg_55_95_std.pth" 
 
-# 输出路径
+# 2. ImageNet 图片的根目录 (里面应该是 n021xxx 这种类别文件夹)
+# 确保这个路径下包含 dataset['images'] 里引用的图片
+IMAGE_ROOT = "data/image_data"
+
+# 3. 输出路径
 OUTPUT_IMG_PATH = "data/image_vectors_fixed.npy"
 OUTPUT_TXT_PATH = "data/text_vectors_fixed.npy"
 
-# 模型选择 (你的 config 中 embedding_dim=512，所以必须用 ViT-B/32)
-CLIP_MODEL_NAME = "ViT-B/32" 
-BATCH_SIZE = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CLIP_MODEL = "ViT-B/32" # 确保和你 Config 里的维度一致 (ViT-B/32 输出 512维)
 # ===========================================
 
 def main():
-    print(f"正在加载 CLIP 模型: {CLIP_MODEL_NAME} 到 {DEVICE}...")
-    model, preprocess = clip.load(CLIP_MODEL_NAME, device=DEVICE)
-    
-    # 1. 扫描并排序文件
-    # ImageNet-EEG 的标准顺序通常是：按类别文件夹排序 -> 按文件名排序
-    print("正在扫描文件目录...")
-    class_folders = sorted([d for d in os.listdir(IMAGE_ROOT) if os.path.isdir(os.path.join(IMAGE_ROOT, d))])
-    
-    all_image_paths = []
-    all_class_names = [] # 用于生成文本向量
-    
-    for class_folder in class_folders:
-        folder_path = os.path.join(IMAGE_ROOT, class_folder)
-        # 获取该类别下的所有图片并排序
-        images = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        
-        for img_name in images:
-            all_image_paths.append(os.path.join(folder_path, img_name))
-            # 简单的文本提示: "This is a photo of [class_id]" 或者是具体的类别名
-            # 这里我们暂时用类别文件夹名作为 prompt，或者你可以替换为更具体的标签
-            all_class_names.append(f"a photo of {class_folder}")
+    print(f"正在加载 EEG 数据集元数据: {EEG_PATH} ...")
+    try:
+        data = torch.load(EEG_PATH, map_location='cpu')
+        # 核心：获取数据集内部定义的图片列表
+        # 这是唯一的真理标准，必须按这个顺序生成向量！
+        target_images = data['images'] 
+        print(f"成功获取图片列表，共 {len(target_images)} 张图片。")
+        print(f"样例 [0]: {target_images[0]}")
+        print(f"样例 [100]: {target_images[100]}")
+    except KeyError:
+        print("错误：无法在 .pth 文件中找到 'images' 键。")
+        print("可用键名:", data.keys())
+        return
 
-    total_images = len(all_image_paths)
-    print(f"扫描完成，找到 {total_images} 张图片 (预期应为 2000)。")
+    print(f"正在加载 CLIP 模型: {CLIP_MODEL} ...")
+    model, preprocess = clip.load(CLIP_MODEL, device=DEVICE)
     
-    # 2. 提取图像特征
-    print("开始提取图像特征...")
-    image_features_list = []
+    img_vectors = []
+    txt_vectors = []
     
-    # 分批处理
-    for i in tqdm(range(0, total_images, BATCH_SIZE)):
-        batch_paths = all_image_paths[i : i + BATCH_SIZE]
-        batch_inputs = []
-        valid_indices = [] # 记录这个 batch 里哪些图是好的
+    print("开始生成对齐向量...")
+    
+    # 遍历列表，确保生成的向量顺序与 target_images 严格一致
+    for img_name in tqdm(target_images):
+        # target_images 里的文件名通常是 'n01443537_22563.JPEG'
+        # 我们需要找到它在磁盘上的真实路径
         
-        # 预处理图片
-        for idx, p in enumerate(batch_paths):
-            try:
-                image = Image.open(p).convert("RGB")
-                processed = preprocess(image)
-                batch_inputs.append(processed)
-                valid_indices.append(idx)
-            except Exception as e:
-                print(f"\n[警告] 图片损坏，已跳过并填充零向量: {p}")
-                # 坏图不加入 batch_inputs，稍后在结果里补 0
-                pass
+        # 解析类别文件夹 (文件名下划线前面部分)
+        class_folder = img_name.split('_')[0] 
         
-        if len(batch_inputs) > 0:
-            # 堆叠并送入模型
-            batch_tensor = torch.stack(batch_inputs).to(DEVICE)
+        # 拼凑可能的路径
+        # 路径格式通常是: IMAGE_ROOT / class_folder / img_name
+        full_path = os.path.join(IMAGE_ROOT, class_folder, img_name)
+        
+        # 容错：如果 dataset 里没后缀，加上 .JPEG 试试
+        if not os.path.exists(full_path):
+             if not img_name.lower().endswith('.jpeg'):
+                 full_path = os.path.join(IMAGE_ROOT, class_folder, img_name + '.JPEG')
+
+        # ---------------- 图像处理 ----------------
+        try:
+            image = Image.open(full_path).convert("RGB")
+            image_input = preprocess(image).unsqueeze(0).to(DEVICE)
+            
             with torch.no_grad():
-                # Encode 并归一化
-                features = model.encode_image(batch_tensor)
-                features = features / features.norm(dim=1, keepdim=True)
-                features_np = features.cpu().numpy()
-        
-        # 组装结果 (含坏图填充)
-        batch_outputs = np.zeros((len(batch_paths), 512), dtype=np.float32)
-        
-        if len(batch_inputs) > 0:
-            # 把算出来的特征填回对应的位置
-            for real_idx, vec_idx in enumerate(valid_indices):
-                batch_outputs[vec_idx] = features_np[real_idx]
-                
-        image_features_list.append(batch_outputs)
+                img_feat = model.encode_image(image_input)
+                # 归一化 (CLIP 标准操作)
+                img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                img_vectors.append(img_feat.cpu().numpy())
+        except Exception as e:
+            print(f"\n[警告] 无法读取图片: {img_name}")
+            print(f"尝试路径: {full_path}")
+            print(f"错误信息: {e}")
+            # 填充随机向量或零向量，保证索引不乱 (非常重要！)
+            # 这样即使缺图，第 N 个向量依然对应第 N 个 EEG
+            img_vectors.append(np.zeros((1, 512), dtype=np.float32))
 
-    # 合并保存
-    final_img_vecs = np.concatenate(image_features_list, axis=0)
-    print(f"图像向量生成完毕，形状: {final_img_vecs.shape}")
-    np.save(OUTPUT_IMG_PATH, final_img_vecs)
-    
-    # 3. 提取文本特征 (可选，确保一一对应)
-    print("开始提取文本特征...")
-    text_features_list = []
-    
-    for i in tqdm(range(0, total_images, BATCH_SIZE)):
-        batch_texts = all_class_names[i : i + BATCH_SIZE]
-        tokens = clip.tokenize(batch_texts).to(DEVICE)
+        # ---------------- 文本处理 ----------------
+        # 使用类别名作为文本: "a photo of [CLASS_ID]"
+        # 如果你想更精确，可以加载 imagenet_classes.txt 将 ID 映射为单词
+        text_prompt = f"a photo of {class_folder}" 
+        text_input = clip.tokenize([text_prompt]).to(DEVICE)
         
         with torch.no_grad():
-            features = model.encode_text(tokens)
-            features = features / features.norm(dim=1, keepdim=True)
-            text_features_list.append(features.cpu().numpy())
-            
-    final_txt_vecs = np.concatenate(text_features_list, axis=0)
-    print(f"文本向量生成完毕，形状: {final_txt_vecs.shape}")
-    np.save(OUTPUT_TXT_PATH, final_txt_vecs)
+            txt_feat = model.encode_text(text_input)
+            txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+            txt_vectors.append(txt_feat.cpu().numpy())
+
+    # 合并并保存
+    final_img_vecs = np.concatenate(img_vectors, axis=0)
+    final_txt_vecs = np.concatenate(txt_vectors, axis=0)
     
-    print("\n✅ 所有向量已重新生成并保存！")
-    print(f"请在 configs/triplet_config.yaml 中更新路径指向: \n{OUTPUT_IMG_PATH}\n{OUTPUT_TXT_PATH}")
+    print(f"\n保存中... 图像向量形状: {final_img_vecs.shape}")
+    np.save(OUTPUT_IMG_PATH, final_img_vecs)
+    np.save(OUTPUT_TXT_PATH, final_txt_vecs)
+    print("✅ 完成！现在向量与 .pth 文件的索引已严格对齐。")
 
 if __name__ == "__main__":
     main()

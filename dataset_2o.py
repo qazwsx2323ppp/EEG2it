@@ -4,11 +4,14 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import os
-import warnings 
+import warnings
+# 【新增】 必须导入 scipy 的插值函数，否则会报 NameError
+from scipy.interpolate import interp1d 
 
 class TripletDataset(Dataset):
     """
     用于加载 (EEG, 图像向量, 文本向量) 三元组的数据集。
+    严格复刻 DreamDiffusion 的预处理逻辑 (Slice + Interpolate)。
     """
 
     def __init__(self, cfg_data, mode='train', split_index=0):
@@ -76,34 +79,38 @@ class TripletDataset(Dataset):
         # 1. 获取原始 EEG 数据
         eeg_original_index = self.indices[idx]
         eeg_item_dict = self.all_eeg_items[eeg_original_index]
-        eeg_signal = eeg_item_dict['eeg'].float()
+        
+        # 2. 读取数据并转为 numpy (为了使用 scipy 插值)
+        # 假设原始数据形状是 (Channels, Time) 例如 (128, 500)
+        eeg_signal = eeg_item_dict['eeg'].float().numpy() 
+        
+        # --- 【核心修正 1】: 严格复刻官方的转置与切片逻辑 (20ms~460ms) ---
+        # 官方逻辑先 .t() (转置为 Time, Channel)，切片，再转回来
+        eeg_signal = eeg_signal.T  # (Time, Channel)
+        eeg_signal = eeg_signal[20:460, :] # 丢弃前20ms伪迹，保留中间440ms
+        eeg_signal = eeg_signal.T  # (Channel, Time) -> (128, 440)
 
-        # 2. 长度处理：裁剪或填充到 440
-        target_length = 440
+        # --- 【核心修正 2】: 使用插值 (Interpolation) 拉伸到 512 ---
+        target_length = 512
         current_length = eeg_signal.shape[-1]
         
-        if current_length > target_length:
-            eeg_signal = eeg_signal[..., :target_length]
-        elif current_length < target_length:
-            # 填充 0
-            padding_shape = list(eeg_signal.shape)
-            padding_shape[-1] = target_length - current_length
-            padding = torch.zeros(padding_shape, dtype=eeg_signal.dtype, device=eeg_signal.device)
-            eeg_signal = torch.cat((eeg_signal, padding), dim=-1)
+        if current_length != target_length:
+            x = np.linspace(0, 1, current_length)
+            x2 = np.linspace(0, 1, target_length)
+            # 对最后一个维度 (Time) 进行插值
+            f = interp1d(x, eeg_signal, axis=-1) 
+            eeg_signal = f(x2)
+        
+        # 转回 PyTorch Tensor
+        eeg_signal = torch.from_numpy(eeg_signal).float()
 
-        # =======================================================
-        # 【核心修正】 强制 Z-Score 归一化 (Per-sample Normalization)
-        # =======================================================
-        # 目的：将信号强度(Std)从 ~0.4 拉升到 1.0，匹配 DreamDiffusion 预训练分布
-        # dim=-1 表示在时间维度上计算均值和标准差，对每个通道独立/或整体归一化均可
-        # 这里我们对每个通道的时间序列做标准化
+        # --- 【保留】: Z-Score 归一化 ---
+        # DreamDiffusion 官方虽然依赖预训练分布，但显式归一化通常能加速收敛
         mean = eeg_signal.mean(dim=-1, keepdim=True)
         std = eeg_signal.std(dim=-1, keepdim=True)
-        # 加上 1e-6 是为了防止纯平信号(std=0)导致除以 0
         eeg_signal = (eeg_signal - mean) / (std + 1e-6)
-        # =======================================================
 
-        # 3. 获取对应的图像/文本向量
+        # 3. 获取图像/文本向量
         main_image_index = eeg_item_dict['image']
         image_vector = self.all_image_vectors[main_image_index]
         text_vector = self.all_text_vectors[main_image_index]

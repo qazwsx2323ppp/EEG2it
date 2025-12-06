@@ -34,7 +34,7 @@ training:
   patience: 10
   min_delta: 0.01       # <-- 新增：损失改善小于 0.01 不算“改善”
   #权重衰减 data11.8_0
-  weight_decay: 0.05
+  weight_decay: 0.1
 
   # 损失函数权重 (alpha * loss_img + (1-alpha) * loss_txt)
   alpha: 0.5

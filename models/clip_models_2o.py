@@ -161,18 +161,21 @@ class SpatialMoEEncoder(nn.Module):
         self.expert_visual_head = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.GELU(),
+            nn.Dropout(0.5),
             nn.Linear(self.backbone_dim, embedding_dim)
         )
         
         self.expert_semantic_head = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.GELU(),
+            nn.Dropout(0.5),
             nn.Linear(self.backbone_dim, embedding_dim)
         )
         
         self.expert_fusion_head = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.GELU(),
+            nn.Dropout(0.5),
             nn.Linear(self.backbone_dim, embedding_dim)
         )
 

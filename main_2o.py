@@ -347,19 +347,19 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
                 print(f"\n[DEBUG Step {batch_idx}]")
                 
                 # 1. 检查输入 EEG 是否正常 (应该 Mean≈0, Std≈1)
-                print(f"  Input EEG: Mean={eeg_signals.mean().item():.3f}, Std={eeg_signals.std().item():.3f}, Min={eeg_signals.min().item():.3f}")
+                #print(f"  Input EEG: Mean={eeg_signals.mean().item():.3f}, Std={eeg_signals.std().item():.3f}, Min={eeg_signals.min().item():.3f}")
                 if torch.isnan(eeg_signals).any():
                     print("  !!! ALERT: Input EEG contains NaN!")
     
                 # 2. 检查输出 Embedding 的模长 (如果 L2 生效，Norm 应该严格等于 1.0)
                 img_norm = eeg_img_embeddings.norm(dim=-1).mean().item()
                 txt_norm = eeg_text_embeddings.norm(dim=-1).mean().item()
-                print(f"  Output Norm: Img={img_norm:.4f}, Txt={txt_norm:.4f} (Expect 1.0)")
+                #print(f"  Output Norm: Img={img_norm:.4f}, Txt={txt_norm:.4f} (Expect 1.0)")
                 
                 # 3. 检查输出是否“死”了 (即所有样本输出都一样)
                 # 计算 Batch 内第一个样本和第二个样本的相似度。如果接近 1.0，说明模型发生了坍塌。
                 sim = torch.nn.functional.cosine_similarity(eeg_img_embeddings[0], eeg_img_embeddings[1], dim=0)
-                print(f"  Diversity Check: Sim(Batch[0], Batch[1]) = {sim.item():.4f} (接近 1.0 说明模型坍塌)")
+                #print(f"  Diversity Check: Sim(Batch[0], Batch[1]) = {sim.item():.4f} (接近 1.0 说明模型坍塌)")
             # ================================
 
             # 计算损失
@@ -522,7 +522,7 @@ def main(cfg: DictConfig):
             # 给 Router 和 Heads 正常的学习率 (如 1e-4)
             {"params": head_params, "lr": cfg.training.learning_rate}, 
         ],
-           weight_decay=cfg.training.get("weight_decay", 0.05)
+           weight_decay=cfg.training.get("weight_decay", 0.1)
     )
 
     # --- 【新增】 学习率调度器 ---
@@ -549,10 +549,14 @@ def main(cfg: DictConfig):
     epochs_no_improve = 0
     
     # 设定解冻 Backbone 的 Epoch (例如第 10 个 Epoch)
-    unfreeze_epoch = 0 
+    #既然数据量这么小，微调 Backbone 极易导致“灾难性遗忘”和过拟合。 
+    # DreamDiffusion 的预训练权重已经包含了非常通用的脑电特征（在 10 万+ 样本上练出来的）。
+    # 完全信任它，只训练后面的“翻译层”（Expert Heads）
+    # 将解冻轮数设为一个不可能达到的数字，实现全程冻结
+    unfreeze_epoch = 10000 
     
     # --- 【新增】 初始冻结 Backbone ---
-    freeze_backbone(model, freeze=False)
+    freeze_backbone(model, freeze=True)
 
     for epoch in range(cfg.training.epochs):
         

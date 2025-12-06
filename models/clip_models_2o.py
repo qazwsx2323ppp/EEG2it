@@ -197,34 +197,46 @@ class SpatialMoEEncoder(nn.Module):
         # latent shape: [batch, num_patches, 1024]
         latent, _, _ = self.backbone.forward_encoder(x_padded, mask_ratio=0.0)
         
-        # 聚合特征 (Global Average Pooling) -> [batch, 1024]
-        shared_features = latent.mean(dim=1)
 
-        # 3. 计算 Router 权重 (使用原始 x 计算，保持物理意义)
-        # feat_for_router: [batch, channels, 1] -> [batch, channels]
-        feat_for_router = self.router_pool(x).squeeze(-1) 
-        gates = self.router_net(feat_for_router) # [batch, 4]
+        ##暂时关闭MOE策略，先验证BACKONE的可行性
+        # # 聚合特征 (Global Average Pooling) -> [batch, 1024]
+        # shared_features = latent.mean(dim=1)
+
+        # # 3. 计算 Router 权重 (使用原始 x 计算，保持物理意义)
+        # # feat_for_router: [batch, channels, 1] -> [batch, channels]
+        # feat_for_router = self.router_pool(x).squeeze(-1) 
+        # gates = self.router_net(feat_for_router) # [batch, 4]
         
-        g_vis_img = gates[:, 0:1]
-        g_fus_img = gates[:, 1:2]
-        g_sem_txt = gates[:, 2:3]
-        g_fus_txt = gates[:, 3:4]
+        # g_vis_img = gates[:, 0:1]
+        # g_fus_img = gates[:, 1:2]
+        # g_sem_txt = gates[:, 2:3]
+        # g_fus_txt = gates[:, 3:4]
 
-        # 归一化权重
-        g_vis_img = g_vis_img / (g_vis_img + g_fus_img + 1e-6)
-        g_fus_img = g_fus_img / (g_vis_img + g_fus_img + 1e-6)
-        g_sem_txt = g_sem_txt / (g_sem_txt + g_fus_txt + 1e-6)
-        g_fus_txt = g_fus_txt / (g_sem_txt + g_fus_txt + 1e-6)
+        # # 归一化权重
+        # g_vis_img = g_vis_img / (g_vis_img + g_fus_img + 1e-6)
+        # g_fus_img = g_fus_img / (g_vis_img + g_fus_img + 1e-6)
+        # g_sem_txt = g_sem_txt / (g_sem_txt + g_fus_txt + 1e-6)
+        # g_fus_txt = g_fus_txt / (g_sem_txt + g_fus_txt + 1e-6)
 
-        # 4. 专家前向传播 (现在是轻量级 Adapter)
-        # 这里的“思想”是：虽然特征是共享的，但不同的 Head 负责提取不同的信息
-        emb_vis = self.expert_visual_head(shared_features)
-        emb_sem = self.expert_semantic_head(shared_features)
-        emb_fus = self.expert_fusion_head(shared_features)
+        # # 4. 专家前向传播 (现在是轻量级 Adapter)
+        # # 这里的“思想”是：虽然特征是共享的，但不同的 Head 负责提取不同的信息
+        # emb_vis = self.expert_visual_head(shared_features)
+        # emb_sem = self.expert_semantic_head(shared_features)
+        # emb_fus = self.expert_fusion_head(shared_features)
 
-        # 5. 加权融合
-        final_img_embedding = (g_vis_img * emb_vis) + (g_fus_img * emb_fus)
-        final_text_embedding = (g_sem_txt * emb_sem) + (g_fus_txt * emb_fus)
+        # # 5. 加权融合
+        # final_img_embedding = (g_vis_img * emb_vis) + (g_fus_img * emb_fus)
+        # final_text_embedding = (g_sem_txt * emb_sem) + (g_fus_txt * emb_fus)
+
+        # 2. 【关键修改】 改变 Pooling 策略，只取 CLS 之后的 token
+        # DreamDiffusion 原文通常使用所有 patch 的 flatten 或 mean
+        # 我们这里排除 cls token (index 0)
+        feat = latent[:, 1:, :].mean(dim=1)  # [Batch, 1024]
+
+        # 3. 【临时修改】 旁路掉 Router 和 MoE，直接用一个全连接层输出
+        # 我们暂时只用 expert_visual_head 来做所有事情，验证 Backbone 能力
+        final_img_embedding = self.expert_visual_head(feat)
+        final_text_embedding = self.expert_semantic_head(feat)
     
         # =============== 【新增】 强制 L2 归一化 ===============
         # 这一步至关重要！将向量投射到单位球面上，这是对比学习的标准动作。
@@ -232,5 +244,11 @@ class SpatialMoEEncoder(nn.Module):
         final_text_embedding = F.normalize(final_text_embedding, p=2, dim=-1)
         # =======================================================
     
-        return final_img_embedding, final_text_embedding, {"w_vis_img": g_vis_img.mean(), "w_sem_txt": g_sem_txt.mean()}
-
+        # return final_img_embedding, final_text_embedding, {"w_vis_img": g_vis_img.mean(), "w_sem_txt": g_sem_txt.mean()}
+        # 返回伪造的权重 dict，防止报错
+        # 将 1.0 改为 torch.tensor(1.0)，并且加上 device 以防万一 (虽然 .item() 不依赖 device)
+        # 同时也为了满足 main_2o.py 中可能的其他 tensor 操作要求
+        return final_img_embedding, final_text_embedding, {
+            "w_vis_img": torch.tensor(1.0, device=x.device), 
+            "w_sem_txt": torch.tensor(1.0, device=x.device)
+        }

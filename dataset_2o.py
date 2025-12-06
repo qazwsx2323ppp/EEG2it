@@ -106,9 +106,10 @@ class TripletDataset(Dataset):
 
         # --- 【保留】: Z-Score 归一化 ---
         # DreamDiffusion 官方虽然依赖预训练分布，但显式归一化通常能加速收敛
-        mean = eeg_signal.mean(dim=-1, keepdim=True)
-        std = eeg_signal.std(dim=-1, keepdim=True)
-        eeg_signal = (eeg_signal - mean) / (std + 1e-6)
+        #先注释掉，当前归一化
+        # mean = eeg_signal.mean(dim=-1, keepdim=True)
+        # std = eeg_signal.std(dim=-1, keepdim=True)
+        # eeg_signal = (eeg_signal - mean) / (std + 1e-6)
 
         # 3. 获取图像/文本向量
         main_image_index = eeg_item_dict['image']

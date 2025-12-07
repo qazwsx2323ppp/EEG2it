@@ -188,7 +188,7 @@ class SpatialMoEEncoder(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x):
+    def forward(self, x, ablation=None):
         # x shape: (batch, channels, samples) 
         # DreamDiffusion 需要 (batch, channels, 512)
         
@@ -227,6 +227,18 @@ class SpatialMoEEncoder(nn.Module):
         emb_vis = self.expert_visual_head(shared_features)
         emb_sem = self.expert_semantic_head(shared_features)
         emb_fus = self.expert_fusion_head(shared_features)
+
+        # === 【新增】 专家切除逻辑 (Ablation Logic) ===
+        if ablation == 'kill_visual':
+            # 强制屏蔽视觉专家 (Visual Expert)
+            emb_vis = torch.zeros_like(emb_vis)
+        elif ablation == 'kill_semantic':
+            # 强制屏蔽语义专家 (Semantic Expert)
+            emb_sem = torch.zeros_like(emb_sem)
+        elif ablation == 'kill_fusion':
+            # 强制屏蔽融合专家
+            emb_fus = torch.zeros_like(emb_fus)
+        # ============================================
 
         # # 5. 加权融合
         final_img_embedding = (g_vis_img * emb_vis) + (g_fus_img * emb_fus)

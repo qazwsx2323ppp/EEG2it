@@ -58,6 +58,8 @@ def main():
     # 1. 加载配置
     cfg = OmegaConf.load(CONFIG_PATH)
     
+    cfg.data.root = os.getcwd()  # 获取当前工作目录
+
     # 2. 准备数据 (使用验证集)
     val_dataset = TripletDataset(cfg.data, mode='val', split_index=0)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)

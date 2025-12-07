@@ -15,6 +15,7 @@ class TripletDataset(Dataset):
     """
 
     def __init__(self, cfg_data, mode='train', split_index=0):
+        self.mode = mode
         print(f"正在加载 {mode} 数据（split_index={split_index}）...")
 
         # 1. 加载所有数据到内存
@@ -105,6 +106,19 @@ class TripletDataset(Dataset):
         eeg_signal = torch.from_numpy(eeg_signal).float()
 
         
+        # === 【新增】 训练时数据增强 ===
+        if self.mode == 'train':
+            # 1. 高斯噪声注入 (Gaussian Noise)
+            # 强度设为 0.01 ~ 0.05 (根据信号 Std≈1.0)
+            noise = torch.randn_like(eeg_signal) * 0.02
+            eeg_signal = eeg_signal + noise
+            
+            # 2. (可选) 随机时间偏移 (Temporal Shift)
+            # 模拟脑电响应的微小时间差
+            if torch.rand(1) < 0.5:
+                shift = torch.randint(-5, 5, (1,)).item()
+                eeg_signal = torch.roll(eeg_signal, shifts=shift, dims=-1)
+
 
         # --- 【保留】: Z-Score 归一化 ---
         # DreamDiffusion 官方虽然依赖预训练分布，但显式归一化通常能加速收敛

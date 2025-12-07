@@ -91,44 +91,44 @@ class SpatialMoEEncoder(nn.Module):
 
             # ... (前文的伪造 config 代码保持不变) ...
 
-        # 1. 加载文件
-        print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
-        checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
-        
-        # 2. 基础拆包 (先拿到大字典)
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        else:
-            state_dict = checkpoint
-
-        # 3. 【核心修正】智能筛选与重命名
-        # 目标：从大模型中提取 'cond_stage_model.mae.' 开头的权重
-        new_state_dict = {}
-        target_prefix = "cond_stage_model.mae."
-        
-        print(f"正在从完整生成模型中提取 EEG Encoder 权重 (前缀: {target_prefix})...")
-        
-        for k, v in state_dict.items():
-            # 情况 A: 权重带有完整前缀 (最可能的情况)
-            if k.startswith(target_prefix):
-                new_key = k.replace(target_prefix, "")
-                new_state_dict[new_key] = v
-            # 情况 B: 万一权重已经是 mae. 开头 (以防万一)
-            elif k.startswith("mae."):
-                new_key = k.replace("mae.", "")
-                new_state_dict[new_key] = v
-                
-        # 4. 如果提取到了参数，进行加载
-        if len(new_state_dict) > 0:
-            print(f">>> 成功提取了 {len(new_state_dict)} 个 EEG Encoder 参数。")
-            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-            print(f">>> 权重加载详情: {msg}")
+            # 1. 加载文件
+            print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
             
-            ## --- 【修正后的检查逻辑】 ---
-            # 过滤掉所有 decoder 相关的缺失键，因为我们不需要 Decoder
-            missing_keys = [k for k in msg.missing_keys if not k.startswith('decoder_') and not k.startswith('mask_token')]
+            # 2. 基础拆包 (先拿到大字典)
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                state_dict = checkpoint
+    
+            # 3. 【核心修正】智能筛选与重命名
+            # 目标：从大模型中提取 'cond_stage_model.mae.' 开头的权重
+            new_state_dict = {}
+            target_prefix = "cond_stage_model.mae."
+            
+            print(f"正在从完整生成模型中提取 EEG Encoder 权重 (前缀: {target_prefix})...")
+            
+            for k, v in state_dict.items():
+                # 情况 A: 权重带有完整前缀 (最可能的情况)
+                if k.startswith(target_prefix):
+                    new_key = k.replace(target_prefix, "")
+                    new_state_dict[new_key] = v
+                # 情况 B: 万一权重已经是 mae. 开头 (以防万一)
+                elif k.startswith("mae."):
+                    new_key = k.replace("mae.", "")
+                    new_state_dict[new_key] = v
+                    
+            # 4. 如果提取到了参数，进行加载
+            if len(new_state_dict) > 0:
+                print(f">>> 成功提取了 {len(new_state_dict)} 个 EEG Encoder 参数。")
+                msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+                print(f">>> 权重加载详情: {msg}")
+                
+                ## --- 【修正后的检查逻辑】 ---
+                # 过滤掉所有 decoder 相关的缺失键，因为我们不需要 Decoder
+                missing_keys = [k for k in msg.missing_keys if not k.startswith('decoder_') and not k.startswith('mask_token')]
             
             # 打印结果
             if len(missing_keys) > 0:

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
 
 class InfoNCE(nn.Module):
     """
@@ -10,9 +10,14 @@ class InfoNCE(nn.Module):
     它封装了您在 loss_calculation 中找到的逻辑，并修复了 device 报错。
     """
 
-    def __init__(self, temperature=0.1):
+    # def __init__(self, temperature=0.1):
+    #     super().__init__()
+    #     self.temperature = temperature
+    #     self.cross_entropy = nn.CrossEntropyLoss()
+    def __init__(self, initial_temperature=0.07): # CLIP 默认初始值
         super().__init__()
-        self.temperature = temperature
+        # 将 temperature 变成一个可训练的参数 (Parameter)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / initial_temperature))
         self.cross_entropy = nn.CrossEntropyLoss()
 
     def forward(self, features1, features2):
@@ -21,13 +26,19 @@ class InfoNCE(nn.Module):
         features1: 第一个模态的特征 (例如, EEG 向量), 形状 [batch_size, embedding_dim]
         features2: 第二个模态的特征 (例如, 图像/文本向量), 形状 [batch_size, embedding_dim]
         """
-        # 从输入的张量中动态获取 device，这是正确的做法
-        device = features1.device
+        
 
         # 计算相似度矩阵
         # 形状: [batch_size, batch_size]
-        logits = (features1 @ features2.T) / self.temperature
+        # logits = (features1 @ features2.T) / self.temperature
+        # 动态计算 temperature
+        logit_scale = self.logit_scale.exp()
+        # 计算相似度矩阵
+        logits = (features1 @ features2.T) * logit_scale
+        
 
+        # 从输入的张量中动态获取 device，这是正确的做法
+        device = features1.device
         # 创建目标标签（一个单位矩阵）
         # 形状: [batch_size]
         targets = torch.arange(logits.shape[0], device=device, dtype=torch.long)

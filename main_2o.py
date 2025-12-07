@@ -282,19 +282,19 @@ from dataset_2o import TripletDataset
 # 设置 PyTorch 以获得更好的性能
 torch.backends.cudnn.benchmark = True
 
-
-def freeze_backbone(model, freeze=True):
-    """
-    冻结或解冻 Backbone 的辅助函数
-    """
-    # 假设你的 SpatialMoEEncoder 中有一个 self.backbone (即 MAEforEEG)
-    if hasattr(model, 'backbone'):
-        for param in model.backbone.parameters():
-            param.requires_grad = not freeze
-        state = "冻结" if freeze else "解冻"
-        print(f">>> Backbone 已{state}。")
-    else:
-        print("警告: 模型中未找到 'backbone' 属性，无法执行冻结/解冻操作。")
+#已经在下面手动控制了 requires_grad
+# def freeze_backbone(model, freeze=True):
+#     """
+#     冻结或解冻 Backbone 的辅助函数
+#     """
+#     # 假设你的 SpatialMoEEncoder 中有一个 self.backbone (即 MAEforEEG)
+#     if hasattr(model, 'backbone'):
+#         for param in model.backbone.parameters():
+#             param.requires_grad = not freeze
+#         state = "冻结" if freeze else "解冻"
+#         print(f">>> Backbone 已{state}。")
+#     else:
+#         print("警告: 模型中未找到 'backbone' 属性，无法执行冻结/解冻操作。")
 
 
 def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, device, alpha, scaler, scheduler):
@@ -343,22 +343,22 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
                 weights_info = None
             
             # === 【调试探针】请插入这段代码 ===
-            if batch_idx % 50 == 0: # 每50个batch打印一次
-                print(f"\n[DEBUG Step {batch_idx}]")
+            # if batch_idx % 50 == 0: # 每50个batch打印一次
+            #     print(f"\n[DEBUG Step {batch_idx}]")
                 
                 # 1. 检查输入 EEG 是否正常 (应该 Mean≈0, Std≈1)
                 #print(f"  Input EEG: Mean={eeg_signals.mean().item():.3f}, Std={eeg_signals.std().item():.3f}, Min={eeg_signals.min().item():.3f}")
-                if torch.isnan(eeg_signals).any():
-                    print("  !!! ALERT: Input EEG contains NaN!")
+                # if torch.isnan(eeg_signals).any():
+                #     print("  !!! ALERT: Input EEG contains NaN!")
     
                 # 2. 检查输出 Embedding 的模长 (如果 L2 生效，Norm 应该严格等于 1.0)
-                img_norm = eeg_img_embeddings.norm(dim=-1).mean().item()
-                txt_norm = eeg_text_embeddings.norm(dim=-1).mean().item()
+                # img_norm = eeg_img_embeddings.norm(dim=-1).mean().item()
+                # txt_norm = eeg_text_embeddings.norm(dim=-1).mean().item()
                 #print(f"  Output Norm: Img={img_norm:.4f}, Txt={txt_norm:.4f} (Expect 1.0)")
                 
                 # 3. 检查输出是否“死”了 (即所有样本输出都一样)
                 # 计算 Batch 内第一个样本和第二个样本的相似度。如果接近 1.0，说明模型发生了坍塌。
-                sim = torch.nn.functional.cosine_similarity(eeg_img_embeddings[0], eeg_img_embeddings[1], dim=0)
+                # sim = torch.nn.functional.cosine_similarity(eeg_img_embeddings[0], eeg_img_embeddings[1], dim=0)
                 #print(f"  Diversity Check: Sim(Batch[0], Batch[1]) = {sim.item():.4f} (接近 1.0 说明模型坍塌)")
             # ================================
 
@@ -482,8 +482,12 @@ def main(cfg: DictConfig):
                              num_workers=cfg.training.num_workers, pin_memory=True)
 
     # 3. 初始化损失函数、优化器、调度器、Scaler
-    loss_fn_img = InfoNCE(temperature=cfg.training.temperature).to(device)
-    loss_fn_txt = InfoNCE(temperature=cfg.training.temperature).to(device)
+    # loss_fn_img = InfoNCE(temperature=cfg.training.temperature).to(device)
+    # loss_fn_txt = InfoNCE(temperature=cfg.training.temperature).to(device)
+    
+    # 修改后：将参数名 temperature 改为 initial_temperature
+    loss_fn_img = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+    loss_fn_txt = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
 
     # # 使用 AdamW，通常 ViT 微调需要较小的 LR，但这里通过调度器控制
     # optimizer = optim.AdamW(
@@ -493,15 +497,33 @@ def main(cfg: DictConfig):
     # )
 
     # 1. 将参数分组
-    backbone_params = []
-    head_params = []
+    # backbone_params = []
+    # head_params = []
+
+    # for name, param in model.named_parameters():
+    #     if "backbone" in name:
+    #         backbone_params.append(param)
+    #     else:
+    #         # 包括 router, expert_heads 等
+    #         head_params.append(param)
+    params_backbone_frozen = [] # 前面的层 (冻结)
+    params_backbone_active = [] # 最后的层 (微调)
+    params_head = []            # Expert Heads (全速训练)
+    loss_params = list(loss_fn_img.parameters()) + list(loss_fn_txt.parameters())
 
     for name, param in model.named_parameters():
         if "backbone" in name:
-            backbone_params.append(param)
+            # 这里的 "blocks.23" 对应 DreamDiffusion (Depth=24) 的最后一层
+            # 也可以加上 "norm" 层
+            if "blocks.23" in name or "blocks.22" in name or "norm." in name:
+                params_backbone_active.append(param)
+                param.requires_grad = True # 确保设为 True
+            else:
+                params_backbone_frozen.append(param)
+                param.requires_grad = False # 确保冻结
         else:
-            # 包括 router, expert_heads 等
-            head_params.append(param)
+            params_head.append(param)
+            param.requires_grad = True
 
     # # 2. 定义优化器，给 Backbone 一个更小的学习率 (通常是主学习率的 1/10 或 1/100)
     # optimizer = optim.AdamW(
@@ -515,14 +537,26 @@ def main(cfg: DictConfig):
     # )
 
        # 核心修改：保护你的 DreamDiffusion Backbone
+    # optimizer = optim.AdamW(
+    #     [
+    #         # 给 Backbone 一个极小的学习率 (如 1e-6 或 5e-6)
+    #         {"params": backbone_params, "lr": cfg.training.learning_rate * 0.05}, 
+    #         # 给 Router 和 Heads 正常的学习率 (如 1e-4)
+    #         {"params": head_params, "lr": cfg.training.learning_rate}, 
+    #     ],
+    #        weight_decay=cfg.training.get("weight_decay", 0.1)
+    # )
     optimizer = optim.AdamW(
         [
-            # 给 Backbone 一个极小的学习率 (如 1e-6 或 5e-6)
-            {"params": backbone_params, "lr": cfg.training.learning_rate * 0.05}, 
-            # 给 Router 和 Heads 正常的学习率 (如 1e-4)
-            {"params": head_params, "lr": cfg.training.learning_rate}, 
+            # 头部：大学习率
+            {"params": params_head, "lr": cfg.training.learning_rate}, 
+            # 尾部 Backbone：小学习率 (防止破坏特征)
+            {"params": params_backbone_active, "lr": cfg.training.learning_rate * 0.1}, 
+            # 【新增】 Loss 的参数 (温度)
+            # CLIP 官方对这个参数通常不使用 weight decay
+            {"params": loss_params, "lr": cfg.training.learning_rate, "weight_decay": 0.0},
         ],
-           weight_decay=cfg.training.get("weight_decay", 0.1)
+        weight_decay=0.1
     )
 
     # --- 【新增】 学习率调度器 ---
@@ -556,15 +590,15 @@ def main(cfg: DictConfig):
     unfreeze_epoch = 10000 
     
     # --- 【新增】 初始冻结 Backbone ---
-    freeze_backbone(model, freeze=True)
+    # freeze_backbone(model, freeze=True)
 
     for epoch in range(cfg.training.epochs):
-        
+        #在前面已经手动控制冻结
         # --- 【新增】 在指定 Epoch 解冻 ---
-        if epoch == unfreeze_epoch:
-            print(f">>> 达到第 {epoch} 轮，开始解冻 Backbone 进行全局微调...")
-            freeze_backbone(model, freeze=False)
-            # 可选：解冻后可以重置学习率或调整
+        # if epoch == unfreeze_epoch:
+        #     print(f">>> 达到第 {epoch} 轮，开始解冻 Backbone 进行全局微调...")
+        #     freeze_backbone(model, freeze=False)
+        #     # 可选：解冻后可以重置学习率或调整
             
         avg_loss, avg_loss_img, avg_loss_txt, avg_weights = train_one_epoch(
             model, train_loader, optimizer, loss_fn_img, loss_fn_txt, device, 

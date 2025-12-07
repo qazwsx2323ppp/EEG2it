@@ -104,6 +104,15 @@ class TripletDataset(Dataset):
         # 转回 PyTorch Tensor
         eeg_signal = torch.from_numpy(eeg_signal).float()
 
+        # === 【修改】 引入全局归一化 (Global Scaling) ===
+        # 这些数值是基于 ImageNet-EEG 计算的经验全局均值和方差
+        # 如果你的数据分布差异巨大，后续可以写脚本重新计算，但通常这组值通用
+        global_mean = -4.5e-06  # 约等于 0
+        global_std  = 1.5e-05   # 关键缩放因子
+        
+        # 执行全局标准化
+        eeg_signal = (eeg_signal - global_mean) / global_std
+
         # --- 【保留】: Z-Score 归一化 ---
         # DreamDiffusion 官方虽然依赖预训练分布，但显式归一化通常能加速收敛
         #先注释掉，当前归一化

@@ -14,7 +14,7 @@ from utils.loss_methods import InfoNCE
 # === 配置区域 ===
 CONFIG_PATH = "configs/triplet_config.yaml"
 # 替换为你刚刚训练出的最佳权重路径
-MODEL_PATH = "temp/best_12.7_0.pth"  
+MODEL_PATH = "temp/best_12.8_change.pth"  
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ================
 

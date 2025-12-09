@@ -14,8 +14,8 @@ class SpatialMoEEncoder(nn.Module):
         n_samples,
         # base_encoder_cls,  <-- 不再需要传入类，直接内部实例化 ViT
         # base_encoder_params, <-- 不再需要
-        visual_indices,
-        semantic_indices,
+        # visual_indices,
+        # semantic_indices,
         embedding_dim=512,
         pretrained_path=None  # <-- 新增：预训练权重路径
     ):
@@ -26,8 +26,8 @@ class SpatialMoEEncoder(nn.Module):
         self.embedding_dim = embedding_dim
         
         # 注册索引 (用于生成 mask)
-        self.register_buffer('idx_vis', torch.tensor(visual_indices, dtype=torch.long))
-        self.register_buffer('idx_sem', torch.tensor(semantic_indices, dtype=torch.long))
+        # self.register_buffer('idx_vis', torch.tensor(visual_indices, dtype=torch.long))
+        # self.register_buffer('idx_sem', torch.tensor(semantic_indices, dtype=torch.long))
 
         # --- 1. 定义共享的主干 (DreamDiffusion ViT) ---
         # 这是一个 128 通道的“全能专家”，我们用它来提取特征

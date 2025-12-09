@@ -41,41 +41,55 @@ def main():
     cfg = OmegaConf.load(CONFIG_PATH)
     cfg.data.root = os.getcwd()
     
-    # 加载数据和模型
+    # 加载数据
     dataset = TripletDataset(cfg.data, mode='val', split_index=0)
-    # 取一个大一点的 Batch 来算平均关注度
     loader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=True)
     
-    model = SpatialMoEEncoder(
-        n_channels=128, n_samples=512,
-        # visual_indices=[], semantic_indices=[], # 如果你删了参数，这里也删掉
-        visual_indices=cfg.model.moe_config.visual_indices, # 兼容旧代码
-        semantic_indices=cfg.model.moe_config.semantic_indices,
-        embedding_dim=512
-    ).to(DEVICE)
-    
+    # === 【修改 1】 手动定义预期的视觉区域 (枕叶: 64-127) ===
+    # 这只是为了给热力图画个参考框，和模型实际运行逻辑无关
+    expected_visual_indices = list(range(64, 128)) 
+    expected_semantic_indices = list(range(0, 64))
+    # ======================================================
+
+    # === 【修改 2】 实例化模型时不再从 cfg 读取 ===
+    # 注意：如果你之前修改了 SpatialMoEEncoder 的 __init__ 删除了这两个参数，
+    # 请把下面这两行 visual_indices=... 也删掉。
+    # 如果没删 __init__ 参数，就传空列表 [] 或上面的 expected_visual_indices 占位。
+    try:
+        # 尝试方式 A: 假设你已经删除了 __init__ 中的参数
+        model = SpatialMoEEncoder(
+            n_channels=128, n_samples=512,
+            embedding_dim=512
+        ).to(DEVICE)
+    except TypeError:
+        # 尝试方式 B: 如果 __init__ 还没改，需要传入占位参数
+        print(">>> 检测到模型仍需要索引参数，传入占位数据...")
+        model = SpatialMoEEncoder(
+            n_channels=128, n_samples=512,
+            visual_indices=expected_visual_indices, # 传入占位
+            semantic_indices=expected_semantic_indices, # 传入占位
+            embedding_dim=512
+        ).to(DEVICE)
+
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE), strict=False)
     model.eval()
     
     # 获取一个 Batch
     batch = next(iter(loader))
-    eeg, _, _ = batch
+    eeg, _, _ = batch # 解包 dataset 返回的三元组
     eeg = eeg.to(DEVICE)
     
     print("正在计算 Router 关注度热力图...")
-    # 计算 Visual Expert 的关注度
     vis_saliency = compute_saliency(model, eeg)
     
-    # 归一化到 0-1 以便绘图
+    # 归一化
     vis_saliency = (vis_saliency - vis_saliency.min()) / (vis_saliency.max() - vis_saliency.min())
     
     # === 绘图 ===
     plt.figure(figsize=(15, 5))
+    plt.bar(range(128), vis_saliency, color='blue', alpha=0.7, label='Actual Attention')
     
-    # 绘制 128 个通道的关注度柱状图
-    plt.bar(range(128), vis_saliency, color='blue', alpha=0.7)
-    
-    # 标记你认为应该是 Visual 的区域 (例如 64-127)
+    # === 【修改 3】 使用手动定义的区域画框 ===
     plt.axvspan(64, 128, color='yellow', alpha=0.2, label='Expected Visual Region (Occipital)')
     
     plt.title("Which Channels determine the Visual Expert's Weight?")
@@ -86,10 +100,8 @@ def main():
     plt.savefig("router_saliency.png")
     print("✅ 分析完成！请查看 router_saliency.png")
     
-    # 简单的文本分析
     top_10 = vis_saliency.argsort()[-10:][::-1]
     print(f"Router 最关注的前 10 个通道索引: {top_10}")
-    print("如果这些索引大多落在 64-127 (枕叶) 范围内，说明 Router 自动学会了看枕叶！")
 
 if __name__ == "__main__":
     main()

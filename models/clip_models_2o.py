@@ -3,302 +3,272 @@
 import torch
 from torch import nn
 #from braindecode.models import to_dense_prediction_model
+from models.ddpt_model import MAEforEEG
+import torch.nn.functional as F
 
 
-# ----------------------------------------------------
-# 1. BraindecodeShallow 类的完整定义
-# ----------------------------------------------------
-class BraindecodeShallow(nn.Module):
+class SpatialMoEEncoder(nn.Module):
     def __init__(
-            self,
-            n_channels,
-            n_samples,
-            n_filters_time=40,
-            filter_time_length=25,
-            n_filters_spat=40,
-            pool_time_length=75,
-            pool_time_stride=15,
-            n_linear_layers=1,
-            embedding_dim=128,
-            drop_prob=0.5,
+        self,
+        n_channels,
+        n_samples,
+        # base_encoder_cls,  <-- 不再需要传入类，直接内部实例化 ViT
+        # base_encoder_params, <-- 不再需要
+        # visual_indices,
+        # semantic_indices,
+        embedding_dim=512,
+        pretrained_path=None  # <-- 新增：预训练权重路径
     ):
         super().__init__()
+        
         self.n_channels = n_channels
         self.n_samples = n_samples
-        self.n_filters_time = n_filters_time
-        self.filter_time_length = filter_time_length
-        self.n_filters_spat = n_filters_spat
-        self.pool_time_length = pool_time_length
-        self.pool_time_stride = pool_time_stride
-        self.n_linear_layers = n_linear_layers
         self.embedding_dim = embedding_dim
-        self.drop_prob = drop_prob
+        
+        # 注册索引 (用于生成 mask)
+        # self.register_buffer('idx_vis', torch.tensor(visual_indices, dtype=torch.long))
+        # self.register_buffer('idx_sem', torch.tensor(semantic_indices, dtype=torch.long))
 
-        self.temporal_conv = nn.Conv2d(
-            1, n_filters_time, (filter_time_length, 1), padding="same"
+        # --- 1. 定义共享的主干 (DreamDiffusion ViT) ---
+        # 这是一个 128 通道的“全能专家”，我们用它来提取特征
+        self.backbone = MAEforEEG(
+            time_len=512,      
+            in_chans=128,       # 必须是 128，为了匹配预训练权重
+            patch_size=4,
+            embed_dim=1024,
+            depth=24,
+            num_heads=16,
+            decoder_embed_dim=1024, 
+            mlp_ratio=1.0,            # 新增此行！原来默认是 4.0，必须改为 1.0 以匹配 fc 层权重
+            decoder_depth=8,
+            decoder_num_heads=16
         )
-        self.spat_conv = nn.Conv2d(
-            n_filters_time, n_filters_spat, (1, n_channels), bias=False
+
+        # # 加载预训练权重
+        # if pretrained_path:
+        #     print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
+        #     # --- 【新增】 开始：伪造缺失的 config 模块 ---
+        #     import sys
+        #     import types
+
+        #     # 1. 定义一个空的伪造类
+        #     class DummyConfig:
+        #         pass
+
+        #     # 2. 创建一个伪造的模块，名字叫 'config'
+        #     dummy_config_module = types.ModuleType("config")
+            
+        #     # 3. 将伪造类挂载到伪造模块下 (类名必须完全匹配报错信息：Config_Generative_Model)
+        #     dummy_config_module.Config_Generative_Model = DummyConfig
+            
+        #     # 4. 将伪造模块注入系统，骗过 torch.load
+        #     sys.modules["config"] = dummy_config_module
+        #     # --- 【新增】 结束 ---
+
+        #     # 现在可以安全加载了 (weights_only=False 是必须的)
+        #     checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            
+        #     # 处理 checkpoint 字典结构
+        #     state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        #     # 显式允许加载 pickle 对象（因为我们要加载的 checkpoint 包含旧版 config 类）
+        #     checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+        #     state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        #     # 移除 module. 前缀
+        #     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+
+        # 加载预训练权重
+        if pretrained_path:
+            print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
+            # --- 伪造 config 模块逻辑保持不变 ---
+            import sys
+            import types
+            class DummyConfig: pass
+            dummy_config_module = types.ModuleType("config")
+            dummy_config_module.Config_Generative_Model = DummyConfig
+            sys.modules["config"] = dummy_config_module
+            # ----------------------------------
+
+            # ... (前文的伪造 config 代码保持不变) ...
+
+            # 1. 加载文件
+            print(f"Loading DreamDiffusion checkpoint from {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+            
+            # 2. 基础拆包 (先拿到大字典)
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                state_dict = checkpoint
+    
+            # 3. 【核心修正】智能筛选与重命名
+            # 目标：从大模型中提取 'cond_stage_model.mae.' 开头的权重
+            new_state_dict = {}
+            target_prefix = "cond_stage_model.mae."
+            
+            print(f"正在从完整生成模型中提取 EEG Encoder 权重 (前缀: {target_prefix})...")
+            
+            for k, v in state_dict.items():
+                # 情况 A: 权重带有完整前缀 (最可能的情况)
+                if k.startswith(target_prefix):
+                    new_key = k.replace(target_prefix, "")
+                    new_state_dict[new_key] = v
+                # 情况 B: 万一权重已经是 mae. 开头 (以防万一)
+                elif k.startswith("mae."):
+                    new_key = k.replace("mae.", "")
+                    new_state_dict[new_key] = v
+                    
+            # 4. 如果提取到了参数，进行加载
+            if len(new_state_dict) > 0:
+                print(f">>> 成功提取了 {len(new_state_dict)} 个 EEG Encoder 参数。")
+                msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+                print(f">>> 权重加载详情: {msg}")
+                
+                ## --- 【修正后的检查逻辑】 ---
+                # 过滤掉所有 decoder 相关的缺失键，因为我们不需要 Decoder
+                missing_keys = [k for k in msg.missing_keys if not k.startswith('decoder_') and not k.startswith('mask_token')]
+            
+            # 打印结果
+            if len(missing_keys) > 0:
+                print(f">>> ⚠️ 注意：部分 Encoder 权重未加载 (Missing Keys): {missing_keys}")
+                # 只有当核心 Encoder 层缺失时才报严重警告
+                if any("blocks" in k for k in missing_keys) or any("patch_embed" in k for k in missing_keys):
+                    print("!!! 严重警告：核心 Encoder Block 缺失！请检查前缀！")
+                else:
+                    print(">>> (这些缺失可能不影响 Encoder 功能，如 head 等)")
+            else:
+                print(">>> ✅ 完美！所有 Encoder 核心权重均已加载！")
+
+            # 确认 Decoder 确实被忽略了
+            decoder_missing = [k for k in msg.missing_keys if k.startswith('decoder_')]
+            if len(decoder_missing) > 0:
+                print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
+
+            
+            # (可选) 冻结主干，只训练后面的 Router 和 Heads，节省显存
+            # for param in self.backbone.parameters():
+            #     param.requires_grad = False
+
+        # --- 2. 定义轻量级专家头 (Adapter Experts) ---
+        # 我们不再用 3 个大模型，而是用 3 个轻量级映射层作为“专家”
+        # 它们接收 Backbone 的输出 (1024维)，映射到目标空间 (512维)
+        
+        self.backbone_dim = 1024
+        
+        # 这里的“专家”变成了专门负责转换特征的 Adapter
+        self.expert_visual_head = nn.Sequential(
+            nn.Linear(self.backbone_dim, self.backbone_dim),
+            nn.GELU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.backbone_dim, embedding_dim)
         )
-        self.batch_norm = nn.BatchNorm2d(n_filters_spat)
-        self.avg_pool = nn.AvgPool2d(
-            kernel_size=(pool_time_length, 1), stride=(pool_time_stride, 1)
+        
+        self.expert_semantic_head = nn.Sequential(
+            nn.Linear(self.backbone_dim, self.backbone_dim),
+            nn.GELU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.backbone_dim, embedding_dim)
         )
-        self.dropout = nn.Dropout(drop_prob)
-
-        # --- 修改开始 ---
-        # 1. 'out' 重命名为 'backbone'，并且不包含最后的 'lin_embedding'
-        self.backbone = nn.Sequential()
-        self.out_dim = self.calculate_out_dim()  # 卷积和池化后的特征维度
-
-        if n_linear_layers > 1:
-            self.backbone.add_module("lin_intermediate", nn.Linear(self.out_dim, self.out_dim))
-            self.backbone.add_module("lin_activation", nn.ELU())
-            self.backbone.add_module("lin_dropout", nn.Dropout(self.drop_prob))
-            self.final_input_dim = self.out_dim  # 中间层的输出维度
-        else:
-            self.final_input_dim = self.out_dim  # 如果没有中间层，则直接使用 'out_dim'
-
-        # 2. 创建两个独立的输出头
-        self.head_img = nn.Linear(self.final_input_dim, embedding_dim)
-        self.head_txt = nn.Linear(self.final_input_dim, embedding_dim)
-        # --- 修改结束 ---
-
-    def calculate_out_dim(self):
-        # 模拟一次前向传播以获取输出维度
-        dummy_input = torch.randn(1, 1, self.n_samples, self.n_channels)
-        x = self.temporal_conv(dummy_input)
-        x = self.spat_conv(x)
-        x = self.batch_norm(x)
-        x = torch.square(x)
-        x = self.avg_pool(x)
-        x = torch.log(torch.clamp(x, min=1e-6))
-        x = self.dropout(x)
-        return int(x.reshape(x.shape[0], -1).shape[1])
-
-    def forward(self, x):
-        # 确保输入形状为 (batch, 1, samples, channels)
-        if len(x.shape) == 3:
-            x = x.unsqueeze(1)
-        x = x.permute(0, 1, 3, 2)  # (batch, 1, channels, samples) -> (batch, 1, samples, channels)
-
-        x = self.temporal_conv(x)
-        x = self.spat_conv(x)
-        x = self.batch_norm(x)
-        x = torch.square(x)
-        x = self.avg_pool(x)
-        x = torch.log(torch.clamp(x, min=1e-6))
-        x = self.dropout(x)
-        x = x.reshape(x.shape[0], -1)  # 展平
-
-        # --- 修改开始 ---
-        # 1. 通过共享的 'backbone' (可能包含中间层)
-        shared_features = self.backbone(x)
-
-        # 2. 将共享特征分别送入两个独立的头
-        out_img = self.head_img(shared_features)
-        out_txt = self.head_txt(shared_features)
-
-        # 3. 返回两个向量
-        return out_img, out_txt
-        # --- 修改结束 ---
-
-
-# ----------------------------------------------------
-# 2. BraindecodeDeep 类的修改 (逻辑同上)
-# ----------------------------------------------------
-class BraindecodeDeep(nn.Module):
-    def __init__(
-            self,
-            n_channels,
-            n_samples,
-            n_filters_time=25,
-            filter_time_length=10,
-            n_filters_spat=25,
-            pool_time_length=3,
-            pool_time_stride=3,
-            n_linear_layers=1,
-            embedding_dim=128,
-            drop_prob=0.5,
-    ):
-        super().__init__()
-        self.n_channels = n_channels
-        self.n_samples = n_samples
-        self.n_filters_time = n_filters_time
-        self.filter_time_length = filter_time_length
-        self.n_filters_spat = n_filters_spat
-        self.pool_time_length = pool_time_length
-        self.pool_time_stride = pool_time_stride
-        self.n_linear_layers = n_linear_layers
-        self.embedding_dim = embedding_dim
-        self.drop_prob = drop_prob
-
-        # ... (前面的卷积块 conv1, conv2, block2, block3, block4 保持不变) ...
-        # 第一个卷积块
-        self.conv1 = nn.Conv2d(1, n_filters_time, (filter_time_length, 1), stride=1)
-        self.conv2 = nn.Conv2d(n_filters_time, n_filters_spat, (1, n_channels), bias=False)
-        self.batch_norm1 = nn.BatchNorm2d(n_filters_spat)
-        self.act1 = nn.ELU()
-        self.pool1 = nn.MaxPool2d(
-            kernel_size=(pool_time_length, 1), stride=(pool_time_stride, 1)
+        
+        self.expert_fusion_head = nn.Sequential(
+            nn.Linear(self.backbone_dim, self.backbone_dim),
+            nn.GELU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.backbone_dim, embedding_dim)
         )
-        self.dropout1 = nn.Dropout(drop_prob)
 
-        # 辅助函数来创建后续的卷积块
-        def _create_conv_block(in_filters, out_filters, kernel, pool_kernel, pool_stride):
-            return nn.Sequential(
-                nn.Conv2d(in_filters, out_filters, (kernel, 1), stride=1, bias=False),
-                nn.BatchNorm2d(out_filters),
-                nn.ELU(),
-                nn.MaxPool2d(kernel_size=(pool_kernel, 1), stride=(pool_stride, 1)),
-                nn.Dropout(drop_prob),
-            )
+        # --- 3. Router (保持不变) ---
+        self.router_pool = nn.AdaptiveAvgPool1d(1)
+        self.router_net = nn.Sequential(
+            nn.Linear(n_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4), 
+            nn.Sigmoid()
+        )
 
-        # 后续的卷积块
-        self.block2 = _create_conv_block(n_filters_spat, 50, 10, 3, 3)
-        self.block3 = _create_conv_block(50, 100, 10, 3, 3)
-        self.block4 = _create_conv_block(100, 200, 10, 3, 3)
+    def forward(self, x, ablation=None):
+        # x shape: (batch, channels, samples) 
+        # DreamDiffusion 需要 (batch, channels, 512)
+        
+        # 1. 预处理：Padding 到 512
+        
+        x_padded = x
 
-        # --- 修改开始 ---
-        # 1. 'out' 重命名为 'backbone'
-        self.backbone = nn.Sequential()
-        self.out_dim = self.calculate_out_dim()
+        # 2. 通过共享 Backbone 提取全局特征
+        # latent shape: [batch, num_patches, 1024]
+        latent, _, _ = self.backbone.forward_encoder(x_padded, mask_ratio=0.0)
+        
 
-        if n_linear_layers > 1:
-            self.backbone.add_module("lin_intermediate", nn.Linear(self.out_dim, self.out_dim))
-            self.backbone.add_module("lin_activation", nn.ELU())
-            self.backbone.add_module("lin_dropout", nn.Dropout(self.drop_prob))
-            self.final_input_dim = self.out_dim
-        else:
-            self.final_input_dim = self.out_dim
+        ##暂时关闭MOE策略，先验证BACKONE的可行性
+        # # 聚合特征 (Global Average Pooling) -> [batch, 1024]
+        # shared_features = latent.mean(dim=1)
+        shared_features = latent[:, 1:, :].mean(dim=1)
 
-        # 2. 创建两个独立的输出头
-        self.head_img = nn.Linear(self.final_input_dim, embedding_dim)
-        self.head_txt = nn.Linear(self.final_input_dim, embedding_dim)
-        # --- 修改结束 ---
+        # # 3. 计算 Router 权重 (使用原始 x 计算，保持物理意义)
+        # # feat_for_router: [batch, channels, 1] -> [batch, channels]
+        feat_for_router = self.router_pool(x).squeeze(-1) 
+        gates = self.router_net(feat_for_router) # [batch, 4]
+        
+        g_vis_img = gates[:, 0:1]
+        g_fus_img = gates[:, 1:2]
+        g_sem_txt = gates[:, 2:3]
+        g_fus_txt = gates[:, 3:4]
 
-    def calculate_out_dim(self):
-        # 模拟一次前向传播以获取输出维度
-        dummy_input = torch.randn(1, 1, self.n_samples, self.n_channels)
-        x = self.conv1(dummy_input)
-        x = self.conv2(x)
-        x = self.batch_norm1(x)
-        x = self.act1(x)
-        x = self.pool1(x)
-        x = self.dropout1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        return int(x.reshape(x.shape[0], -1).shape[1])
+        # # 归一化权重
+        g_vis_img = g_vis_img / (g_vis_img + g_fus_img + 1e-6)
+        g_fus_img = g_fus_img / (g_vis_img + g_fus_img + 1e-6)
+        g_sem_txt = g_sem_txt / (g_sem_txt + g_fus_txt + 1e-6)
+        g_fus_txt = g_fus_txt / (g_sem_txt + g_fus_txt + 1e-6)
 
-    def forward(self, x):
-        # 确保输入形状为 (batch, 1, samples, channels)
-        if len(x.shape) == 3:
-            x = x.unsqueeze(1)
-        x = x.permute(0, 1, 3, 2)  # (batch, 1, channels, samples) -> (batch, 1, samples, channels)
+        # # 4. 专家前向传播 (现在是轻量级 Adapter)
+        # # 这里的“思想”是：虽然特征是共享的，但不同的 Head 负责提取不同的信息
+        emb_vis = self.expert_visual_head(shared_features)
+        emb_sem = self.expert_semantic_head(shared_features)
+        emb_fus = self.expert_fusion_head(shared_features)
 
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.batch_norm1(x)
-        x = self.act1(x)
-        x = self.pool1(x)
-        x = self.dropout1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = x.reshape(x.shape[0], -1)  # 展平
+        # === 【新增】 专家切除逻辑 (Ablation Logic) ===
+        if ablation == 'kill_visual':
+            # 强制屏蔽视觉专家 (Visual Expert)
+            emb_vis = torch.zeros_like(emb_vis)
+        elif ablation == 'kill_semantic':
+            # 强制屏蔽语义专家 (Semantic Expert)
+            emb_sem = torch.zeros_like(emb_sem)
+        elif ablation == 'kill_fusion':
+            # 强制屏蔽融合专家
+            emb_fus = torch.zeros_like(emb_fus)
+        # ============================================
 
-        # --- 修改开始 ---
-        # 1. 通过共享的 'backbone'
-        shared_features = self.backbone(x)
+        # # 5. 加权融合
+        final_img_embedding = (g_vis_img * emb_vis) + (g_fus_img * emb_fus)
+        final_text_embedding = (g_sem_txt * emb_sem) + (g_fus_txt * emb_fus)
 
-        # 2. 将共享特征分别送入两个独立的头
-        out_img = self.head_img(shared_features)
-        out_txt = self.head_txt(shared_features)
+        # 2. 【关键修改】 改变 Pooling 策略，只取 CLS 之后的 token
+        # DreamDiffusion 原文通常使用所有 patch 的 flatten 或 mean
+        # 我们这里排除 cls token (index 0)
+        # feat = latent[:, 1:, :].mean(dim=1)  # [Batch, 1024]
 
-        # 3. 返回两个向量
-        return out_img, out_txt
-        # --- 修改结束 ---
-
-
-# ----------------------------------------------------
-# 3. 修复后的 EEGEncoder 类 (现在可以正确接收参数)
-# ----------------------------------------------------
-class EEGEncoder(nn.Module):
-    def __init__(
-            self,
-            n_channels,  # <-- 1. 我们在这里添加了 n_channels
-            n_samples,  # <-- 2. 我们在这里添加了 n_samples
-            encoder_name,
-            n_filters_time,
-            filter_time_length,
-            n_filters_spat,
-            pool_time_length,
-            pool_time_stride,
-            n_linear_layers,
-            embedding_dim,
-            drop_prob,
-            channel_merge=None,
-            n_heads=None,
-    ):
-        super().__init__()
-        self.n_channels = n_channels
-        self.n_samples = n_samples
-        self.encoder_name = encoder_name
-        #self.channel_merge = channel_merge
-
-        if self.encoder_name == "braindecode_shallow":
-            self.encoder = BraindecodeShallow(
-                n_channels=self.n_channels,  # <-- 3. 我们将 n_channels 传递下去
-                n_samples=self.n_samples,  # <-- 4. 我们将 n_samples 传递下去
-                n_filters_time=n_filters_time,
-                filter_time_length=filter_time_length,
-                n_filters_spat=n_filters_spat,
-                pool_time_length=pool_time_length,
-                pool_time_stride=pool_time_stride,
-                n_linear_layers=n_linear_layers,
-                embedding_dim=embedding_dim,
-                drop_prob=drop_prob,
-            )
-        elif self.encoder_name == "braindecode_deep":
-            self.encoder = BraindecodeDeep(
-                n_channels=self.n_channels,  # <-- 5. 同样传递给 BraindecodeDeep
-                n_samples=self.n_samples,  # <-- 6. 同样传递给 BraindecodeDeep
-                n_filters_time=n_filters_time,
-                filter_time_length=filter_time_length,
-                n_filters_spat=n_filters_spat,
-                pool_time_length=pool_time_length,
-                pool_time_stride=pool_time_stride,
-                n_linear_layers=n_linear_layers,
-                embedding_dim=embedding_dim,
-                drop_prob=drop_prob,
-            )
-
-        # if self.channel_merge == "attention":
-        #     self.attention_pool = nn.TransformerEncoderLayer(
-        #         d_model=self.encoder.embedding_dim,
-        #         nhead=n_heads,
-        #         dim_feedforward=self.encoder.embedding_dim * 4,
-        #         dropout=drop_prob,
-        #         activation="gelu",
-        #     )
-        #     self.merger = nn.Linear(
-        #         self.encoder.embedding_dim * self.n_channels, embedding_dim
-        #     )
-        # elif self.channel_merge == "linear":
-        #     self.merger = nn.Linear(
-        #         self.encoder.embedding_dim * self.n_channels, embedding_dim
-        #     )
-
-    def forward(self, x):
-        x = self.encoder(x)
-        # if self.channel_merge == "attention":
-        #     x = x.permute(2, 0, 1)  # (time, batch, channels)
-        #     x = self.attention_pool(x)
-        #     x = x.permute(1, 0, 2)  # (batch, time, channels)
-        #     x = x.reshape(x.shape[0], -1)  # (batch, time*channels)
-        #     x = self.merger(x)
-        # elif self.channel_merge == "linear":
-        #     x = x.reshape(x.shape[0], -1)  # (batch, channels*embedding_dim)
-        #     x = self.merger(x)
-        return x
+        # # 3. 【临时修改】 旁路掉 Router 和 MoE，直接用一个全连接层输出
+        # # 我们暂时只用 expert_visual_head 来做所有事情，验证 Backbone 能力
+        # final_img_embedding = self.expert_visual_head(feat)
+        # final_text_embedding = self.expert_semantic_head(feat)
+    
+        # =============== 【新增】 强制 L2 归一化 ===============
+        # 这一步至关重要！将向量投射到单位球面上，这是对比学习的标准动作。
+        final_img_embedding = F.normalize(final_img_embedding, p=2, dim=-1)
+        final_text_embedding = F.normalize(final_text_embedding, p=2, dim=-1)
+        # =======================================================
+    
+        # 返回伪造的权重 dict，防止报错
+        # 将 1.0 改为 torch.tensor(1.0)，并且加上 device 以防万一 (虽然 .item() 不依赖 device)
+        # 同时也为了满足 main_2o.py 中可能的其他 tensor 操作要求
+        # return final_img_embedding, final_text_embedding, {
+        #     "w_vis_img": torch.tensor(1.0, device=x.device), 
+        #     "w_sem_txt": torch.tensor(1.0, device=x.device)
+        # }
+        # 返回真实的权重用于监控
+        return final_img_embedding, final_text_embedding, {
+            "w_vis_img": g_vis_img.mean(), 
+            "w_sem_txt": g_sem_txt.mean()
+        }

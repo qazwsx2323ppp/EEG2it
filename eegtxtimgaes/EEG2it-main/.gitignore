@@ -1,0 +1,87 @@
+# 忽略 wandb 实验记录目录
+wandb/
+# 忽略数据目录
+data/
+
+# 忽略输出目录
+outputs/
+# 忽略模型权重目录
+pth_summaries/
+# 忽略 IDE 配置目录（可选，避免提交 .idea）
+.idea/
+
+ssh/
+temp/
+
+#忽略数据文件
+# 数据集 (Datasets)
+# -----------------
+# 永远不要上传原始数据或处理过的数据
+data/
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.xml
+*.npy
+*.npz
+*.parquet
+*.h5
+*.hdf5
+*.tfrecord
+*.arrow
+
+# 模型权重和检查点 (Model Checkpoints & Weights)
+# -----------------
+models/
+checkpoints/
+*.pt
+*.pth
+*.pth.tar
+*.bin
+*.pb
+*.onnx
+*.safetensors
+*.model
+*.ckpt
+*.index
+*.data-00000-of-00001
+
+# 图像和媒体数据 (Image/Media Data)
+# -----------------
+# (如果它们是你的数据集)
+images/
+videos/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.mp4
+*.avi
+
+
+# ===============
+# 2. Python & 虚拟环境 (Python & Virtual Environments)
+# ===============
+venv/
+virtualenv/
+env/
+.venv/
+# 忽略 Python 编译文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Pip / Conda 依赖缓存
+*.pip
+pip-wheel-metadata/
+.ipynb_checkpoints # Jupyter Notebook 检查点
+
+# 依赖导出文件 (注：`requirements.txt` 应该被提交)
+# requirements.lock

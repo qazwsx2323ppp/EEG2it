@@ -4,8 +4,8 @@ import numpy as np
 from omegaconf import OmegaConf
 import os
 
-from models.clip_models_2o import SpatialMoEEncoder
-from dataset_2o import TripletDataset
+from models.clip_models import SpatialMoEEncoder
+from dataset import TripletDataset
 
 # === 配置 ===
 CONFIG_PATH = "configs/triplet_config.yaml"

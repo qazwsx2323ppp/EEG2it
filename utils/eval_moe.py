@@ -7,8 +7,8 @@ import os
 from omegaconf import OmegaConf
 
 # 引入你的模块
-from models.clip_models_2o import SpatialMoEEncoder
-from dataset_2o import TripletDataset
+from models.clip_models import SpatialMoEEncoder
+from dataset import TripletDataset
 from utils.loss_methods import InfoNCE
 
 # === 配置区域 ===

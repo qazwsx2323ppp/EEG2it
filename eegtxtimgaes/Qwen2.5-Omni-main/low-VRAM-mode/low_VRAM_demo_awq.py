@@ -3,6 +3,8 @@ import time
 import sys
 import importlib.util
 import soundfile as sf
+import os
+from omegaconf import OmegaConf
 
 from awq.models.base import BaseAWQForCausalLM
 from transformers import AutoProcessor
@@ -187,3 +189,87 @@ sf.write(
 print(response[0])
 print(f"Total Inference Time: {end-start:.2f} s.")
 print(f"Peak GPU Memory Used: {peak_memory / 1024 / 1024:.2f} MB")
+###############测试eeg
+def test_eeg_pipeline():
+    print("\n\n=== Testing EEG Pipeline ===")
+    
+    # Try to load real data configuration
+    config_path = "../configs/triplet_config.yaml"
+    real_data_loaded = False
+    eeg_input = None
+    
+    if os.path.exists(config_path):
+        try:
+            print(f"Loading config from {config_path}...")
+            cfg = OmegaConf.load(config_path)
+            
+            # Add parent dir to sys.path to import dataset_2o
+            sys.path.append("..") 
+            from dataset_2o import TripletDataset
+            
+            # Initialize Dataset
+            # Note: This might fail if data paths in yaml are incorrect
+            dataset = TripletDataset(cfg.data, mode='test', split_index=0)
+            print(f"Dataset loaded successfully! Size: {len(dataset)}")
+            
+            if len(dataset) > 0:
+                eeg_data, _, _ = dataset[0]
+                eeg_input = eeg_data.unsqueeze(0).to(device)
+                print(f"Loaded Real EEG Data: {eeg_input.shape}")
+                real_data_loaded = True
+                
+        except Exception as e:
+            print(f"Could not load real data (using dummy data instead): {e}")
+    else:
+        print(f"Config file not found at {config_path}")
+
+    if not real_data_loaded:
+        print("Using Dummy EEG Data...")
+        # Shape: [Batch=1, Channels=128, Time=512]
+        eeg_input = torch.randn(1, 128, 512).to(device)
+    
+    print(f"1. EEG Input Ready: {eeg_input.shape}")
+    
+    try:
+        # 2. Get EEG Embeddings
+        eeg_embeds = model.model.generate_from_eeg(eeg_input)
+        print(f"2. EEG Embeddings Generated: {eeg_embeds.shape}")
+        
+        # 3. Construct Text Prompt
+        prompt = "Describe the image decoded from brain signals."
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ]
+        text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=text_input, return_tensors="pt", padding=True)
+        input_ids = inputs.input_ids.to(device)
+        input_embeds = model.model.get_input_embeddings()(input_ids)
+        
+        # 4. Concatenate
+        final_embeds = torch.cat([eeg_embeds, input_embeds], dim=1)
+        attention_mask = torch.ones(final_embeds.shape[:2], device=device)
+        
+        print(f"3. Final Input Embeddings: {final_embeds.shape}")
+        
+        # 5. Generate
+        print("4. Running Generation...")
+        output_ids = model.generate(
+            inputs_embeds=final_embeds, 
+            attention_mask=attention_mask, 
+            max_new_tokens=50
+        )
+        
+        # 6. Decode
+        generated_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+        print(f"5. Generation Success!\nOutput: {generated_text}")
+        print("=== EEG Pipeline Verified ===")
+        
+    except Exception as e:
+        print(f"!!! Pipeline Failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Uncomment to run the test
+test_eeg_pipeline()
+###############

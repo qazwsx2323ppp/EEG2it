@@ -29,8 +29,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import Parameter
-from torch import nn # 确保导入
-from clip_models_2o import EEGEncoder
+from torch import nn 
+# EEGEncoder not used here; external EEG embeddings are expected
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
 from transformers.generation import GenerationMixin
@@ -84,9 +84,10 @@ logger = logging.get_logger(__name__)
 
 
 class Qwen2RMSNorm(nn.Module):
+## Root Mean Square Normalization (均方根归一化) 层。
     def __init__(self, hidden_size, eps=1e-6):
         """
-        Qwen2RMSNorm is equivalent to T5LayerNorm
+        Qwen2RMSNorm is equivalent to T5LayerNorm #均方根归一化
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -125,6 +126,10 @@ Qwen2_5Omni_START_DOCSTRING = r"""
     Qwen2_5Omni_START_DOCSTRING,
 )
 class Qwen2_5OmniPreTrainedModel(PreTrainedModel):
+    #Qwen2.5-Omni 模型的 预训练模型基类 (Base Class) 
+    #权重管理 ：负责模型的权重加载 ( from_pretrained )、保存 ( save_pretrained ) 和下载。
+    #配置关联 ：通过 config_class = Qwen2_5OmniConfig 将模型与配置文件关联起来。
+
     config_class = Qwen2_5OmniConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -156,6 +161,8 @@ class Qwen2_5OmniPreTrainedModel(PreTrainedModel):
 
 
 class Qwen2_5OmniPreTrainedModelForConditionalGeneration(Qwen2_5OmniPreTrainedModel):
+    #Qwen2.5-Omni 模型的 预训练模型基类 (Base Class) ，用于 条件生成任务（Conditional Generation） 。
+    #主要是为了服务于 条件生成任务（Conditional Generation） ，特别是处理注意力掩码（Attention Mask）的逻辑。
     def _prepare_4d_causal_attention_mask_with_cache_position(
         self,
         attention_mask: torch.Tensor,
@@ -561,6 +568,8 @@ class Qwen2_5OmniPreTrainedModelForConditionalGeneration(Qwen2_5OmniPreTrainedMo
 
 @dataclass
 class Qwen2_5OmniThinkerCausalLMOutputWithPast(ModelOutput):
+
+    #是一个 数据容器类 ，专门用来封装模型（Thinker/LLM部分）的输出结果。
     """
     Base class for Qwen2.5OmniThinker causal language model (or autoregressive) outputs.
 
@@ -595,7 +604,12 @@ class Qwen2_5OmniThinkerCausalLMOutputWithPast(ModelOutput):
     past_key_values: Optional[List[torch.FloatTensor]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
-    rope_deltas: Optional[torch.LongTensor] = None
+    rope_deltas: Optional[torch.LongTensor] = None   # rope_deltas (RoPE 偏移量 - Omni 特有) :
+
+'''
+这是一个多模态模型特有的字段。由于混合了音频/视觉和文本，
+不同模态的 Positional Embedding (位置编码) 可能需要对齐或调整，这个字段记录了相关的索引偏移。
+'''
 
 
 class Qwen2_5OmniAudioAttention(nn.Module):
@@ -2306,6 +2320,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.visual = Qwen2_5OmniVisionEncoder._from_config(
             config.vision_config, attn_implementation=config._attn_implementation
         )
+        # EEG embeddings are provided externally; do not instantiate an encoder here.
+        self.eeg_encoder = None
         # self.audio_tower.cpu()
         # self.visual.cpu()
 
@@ -2335,6 +2351,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         input_features: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
+        ##########
+        eeg_embeds_text: Optional[torch.FloatTensor] = None,
+        eeg_embeds_image: Optional[torch.FloatTensor] = None,
+        ##########
+        eeg_embeds: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -2468,6 +2489,45 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 
                 self.audio_tower.to('cpu')
                 torch.cuda.empty_cache()
+
+            if eeg_embeds_text is not None and hasattr(self.config, "eeg_text_token_index"):
+                num_text_tokens = (input_ids == self.config.eeg_text_token_index).sum(dim=1)
+                if not torch.all(num_text_tokens == 1):
+                    raise ValueError("EEG text embedding requires exactly one EEG text token per sample")
+                text_mask = (
+                    (input_ids == self.config.eeg_text_token_index)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                eeg_embeds_text = eeg_embeds_text.to(inputs_embeds.device, inputs_embeds.dtype).unsqueeze(1)
+                inputs_embeds = inputs_embeds.masked_scatter(text_mask, eeg_embeds_text)
+
+            if eeg_embeds_image is not None and hasattr(self.config, "eeg_image_token_index"):
+                num_image_tokens = (input_ids == self.config.eeg_image_token_index).sum(dim=1)
+                if not torch.all(num_image_tokens == 1):
+                    raise ValueError("EEG image embedding requires exactly one EEG image token per sample")
+                image_mask_eeg = (
+                    (input_ids == self.config.eeg_image_token_index)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                eeg_embeds_image = eeg_embeds_image.to(inputs_embeds.device, inputs_embeds.dtype).unsqueeze(1)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask_eeg, eeg_embeds_image)
+
+            if eeg_embeds is not None and hasattr(self.config, "eeg_token_index"):
+                num_eeg_tokens = (input_ids == self.config.eeg_token_index).sum(dim=1)
+                if not torch.all(num_eeg_tokens == 1):
+                    raise ValueError("EEG embedding requires exactly one EEG token per sample")
+                eeg_mask = (
+                    (input_ids == self.config.eeg_token_index)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                eeg_embeds = eeg_embeds.to(inputs_embeds.device, inputs_embeds.dtype).unsqueeze(1)
+                inputs_embeds = inputs_embeds.masked_scatter(eeg_mask, eeg_embeds)
 
             if pixel_values is not None:
                 self.visual.to('cuda')
@@ -4583,6 +4643,22 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         if config.enable_audio_output:
             self.enable_talker()
 
+        # Initialize EEG components placeholders
+        self.eeg_encoder = None
+        self.qformer = None
+        
+        # Linear layer to project 512 (CLIP dim) -> Thinker Hidden Size
+        thinker_hidden_size = config.thinker_config.hidden_size
+        self.eeg_projector = nn.Linear(512, thinker_hidden_size)
+        
+        # Linear layer to project 512 (CLIP dim) -> Thinker Hidden Size
+        thinker_hidden_size = config.thinker_config.hidden_size
+        self.eeg_projector = nn.Linear(512, thinker_hidden_size)
+        
+        # Linear layer to project 512 (CLIP dim) -> Thinker Hidden Size
+        thinker_hidden_size = config.thinker_config.hidden_size
+        self.eeg_projector = nn.Linear(512, thinker_hidden_size)
+
     def enable_talker(self):
         self.talker = Qwen2_5OmniTalkerForConditionalGeneration(self.config.talker_config)
         self.token2wav = Qwen2_5OmniToken2WavModel(self.config.token2wav_config)
@@ -4603,6 +4679,76 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         if hasattr(self, "token2wav"):
             del self.token2wav
         self.has_talker = False
+
+    def get_input_embeddings(self):
+        return self.thinker.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.thinker.set_input_embeddings(value)
+
+    def generate_from_eeg(
+        self, 
+        eeg_input: torch.Tensor, 
+        prompt_text: str = "Describe the image decoded from brain signals.", 
+        painter_prompt_prefix: str = "Generate an image based on: ",
+        **kwargs
+    ):
+        """
+        EEG 生成流水线 (支持直连模式):
+        1. EEG -> SpatialMoEEncoder -> (Image_Feat, Text_Feat)
+        2. IF Q-Former: -> Q-Former -> EEG_Tokens
+           ELSE:        -> Linear Projector -> EEG_Tokens
+        3. EEG_Tokens + Text_Prompt -> Thinker (LLM)
+        """
+        if self.eeg_encoder is None:
+            raise ValueError("EEG components are not initialized.")
+
+        # 1. EEG Encoding
+        # eeg_input shape: [batch, channels, time] -> [1, 128, 512]
+        emb_img, emb_txt, _ = self.eeg_encoder(eeg_input)
+        
+        # 2. Project to LLM Space
+        eeg_features = torch.stack([emb_img, emb_txt], dim=1) # [batch, 2, 512]
+
+        if getattr(self, 'use_qformer', False) and self.qformer is not None:
+            # Use Q-Former
+            eeg_llm_embeds = self.qformer(eeg_features, return_sequence=True)
+        elif self.eeg_projector is not None:
+            # Use Direct Linear Projection
+            # [batch, 2, 512] -> [batch, 2, hidden_size]
+            eeg_llm_embeds = self.eeg_projector(eeg_features)
+        else:
+             raise ValueError("No projection layer (Q-Former or Linear) found.")
+        
+        return eeg_llm_embeds
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ):
+        return self.thinker(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs,
+        )
 
     @classmethod
     def from_pretrained(

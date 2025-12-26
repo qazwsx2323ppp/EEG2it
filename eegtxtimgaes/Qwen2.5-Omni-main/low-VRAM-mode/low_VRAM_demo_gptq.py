@@ -9,26 +9,31 @@ from gptqmodel.models.auto import MODEL_MAP
 from gptqmodel.models._const import CPU, SUPPORTED_MODELS
 from huggingface_hub import snapshot_download
 
-from qwen_omni_utils import process_mm_info
+# from qwen_omni_utils import process_mm_info # No longer needed for pure EEG-Text
 from typing import Any, Dict
 
 import torch
 import time
-import soundfile as sf
+import sys
+import os
+
+# Add parent directory to path to import models
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models.clip_models import SpatialMoEEncoder
 
 model_path = "Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"
-model_path = snapshot_download(repo_id=model_path) # if you use local model file, delete this line
+# model_path = snapshot_download(repo_id=model_path) # if you use local model file, delete this line
 
 class Qwen25OmniThinkerGPTQ(BaseGPTQModel):
     loader = Qwen2_5OmniForConditionalGeneration
     base_modules = [
         "thinker.model.embed_tokens", 
         "thinker.model.norm", 
-        "token2wav", 
+        # "token2wav", # Removed
         "thinker.audio_tower", 
         "thinker.model.rotary_emb",
         "thinker.visual", 
-        "talker"
+        # "talker" # Removed
     ]
     pre_lm_head_norm_module = "thinker.model.norm"
     require_monkeypatch = False
@@ -60,26 +65,11 @@ SUPPORTED_MODELS.extend(["qwen2_5_omni"])
 def patched_from_config(cls, config, *args, **kwargs):
     kwargs.pop("trust_remote_code", None)
 
-    
     model = cls._from_config(config, **kwargs)
-    spk_path = cached_file(
-        model_path,
-        "spk_dict.pt",
-        subfolder=kwargs.pop("subfolder", None),
-        cache_dir=kwargs.pop("cache_dir", None),
-        force_download=kwargs.pop("force_download", False),
-        proxies=kwargs.pop("proxies", None),
-        resume_download=kwargs.pop("resume_download", None),
-        local_files_only=kwargs.pop("local_files_only", False),
-        token=kwargs.pop("use_auth_token", None),
-        revision=kwargs.pop("revision", None),
-    )
-    if spk_path is None:
-        raise ValueError(f"Speaker dictionary not found at {spk_path}")
-    
-    model.load_speakers(spk_path)
+    # Speaker loading removed as Talker is disabled
+    # spk_path = cached_file(...)
+    # model.load_speakers(spk_path)
 
-    
     return model
 
 Qwen2_5OmniForConditionalGeneration.from_config = patched_from_config
@@ -89,8 +79,8 @@ device_map = {
     "thinker.lm_head": "cuda", 
     "thinker.visual": "cpu",  
     "thinker.audio_tower": "cpu",  
-    "talker": "cuda",  
-    "token2wav": "cuda",  
+    # "talker": "cuda",  # Removed
+    # "token2wav": "cuda",  # Removed
 }
 
 
@@ -103,45 +93,78 @@ model = GPTQModel.load(
 )
 processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
 
-def video_inference(video_path, prompt, sys_prompt):
-    messages = [
-        {"role": "system", "content": [
-                {"type": "text", "text": sys_prompt},
-            ]},
-        {"role": "user", "content": [
-                {"type": "video", "video": video_path},
-            ]
-        },
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+# --- EEG Component Initialization ---
+print("Initializing EEG Components...")
+# Initialize EEG Encoder (SpatialMoEEncoder)
+# Note: Adjust parameters (n_channels, n_samples) to match your EEG data
+eeg_encoder = SpatialMoEEncoder(
+    n_channels=128, 
+    n_samples=512, 
+    embedding_dim=512,
+    # pretrained_path="path/to/dreamdiffusion/checkpoint.pt" # Optional
+).to("cuda").half() # Use half precision to match model
 
-    audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
-    inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True)
-    inputs = inputs.to('cuda').to(model.dtype)
+# Initialize Projector (Linear: 512 -> Hidden Size)
+# This aligns the EEG embedding dimension with the Thinker's hidden size
+thinker_hidden_size = model.config.thinker_config.hidden_size
+eeg_projector = torch.nn.Linear(512, thinker_hidden_size).to("cuda").half()
+
+# Attach components to the model
+model.model.eeg_encoder = eeg_encoder
+model.model.eeg_projector = eeg_projector
+# Ensure tokenizer is available for token addition if needed
+# model.model.tokenizer = processor.tokenizer 
+
+print("EEG Components Initialized.")
+
+def eeg_inference(eeg_data, prompt_text="Describe the image decoded from brain signals."):
+    """
+    Perform inference using EEG data to generate text.
+    """
+    print(f"Input EEG Data Shape: {eeg_data.shape}")
     
+    # Ensure inputs are on the correct device and dtype
+    eeg_data = eeg_data.to("cuda").half()
+    
+    # Use the generate_from_eeg method added to Qwen2_5OmniForConditionalGeneration
+    # If using the GPTQ wrapper, access the underlying model via model.model
+    # We pass the tokenizer so it can handle the <EEG> token automatically
+    
+    gen_ids = model.model.generate_from_eeg(
+        eeg_input=eeg_data,
+        tokenizer=processor.tokenizer,
+        prompt_text=prompt_text,
+        max_new_tokens=128,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9
+    )
+    
+    # Decode generated tokens to text
+    response = processor.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0]
+    return response
 
-    output = model.generate(**inputs, use_audio_in_video=True, return_audio=True)
-    text = processor.batch_decode(output[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    audio = output[2]
-    return text, audio
 
+# --- Demo Execution ---
+# Create dummy EEG data [Batch, Channels, Time]
+dummy_eeg = torch.randn(1, 128, 512) 
 
-video_path = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/draw.mp4"
-system_prompt = "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
-
+print("Starting EEG Inference Demo...")
 torch.cuda.reset_peak_memory_stats()
 start = time.time()
-response, audio  = video_inference(video_path, prompt=None, sys_prompt=system_prompt)
+
+try:
+    response = eeg_inference(dummy_eeg, prompt_text="Please describe what you see.")
+    print("\nGenerated Response:")
+    print(response)
+except Exception as e:
+    print(f"\nError during inference: {e}")
+    import traceback
+    traceback.print_exc()
+
 end = time.time()
 peak_memory = torch.cuda.max_memory_allocated()
 
-audio_file_path = "./output_audio_gptq.wav"
-sf.write(
-    audio_file_path,
-    audio.reshape(-1).detach().cpu().numpy(),
-    samplerate=24000,
-)
-
-print(response[0])
-print(f"Total Inference Time: {end-start:.2f} s.")
+print(f"\nTotal Inference Time: {end-start:.2f} s.")
 print(f"Peak GPU Memory Used: {peak_memory / 1024 / 1024:.2f} MB")
+

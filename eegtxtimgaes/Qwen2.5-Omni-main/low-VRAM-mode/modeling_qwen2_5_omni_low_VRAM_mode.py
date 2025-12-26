@@ -1789,40 +1789,52 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         self.thinker.set_input_embeddings(value)
 
     def generate_from_eeg(
-        self, 
-        eeg_input: torch.Tensor, 
-        prompt_text: str = "Describe the image decoded from brain signals.", 
-        painter_prompt_prefix: str = "Generate an image based on: ",
-        **kwargs
+        self,
+        eeg_input: torch.Tensor,
+        tokenizer: Optional[object] = None,
+        prompt_text: str = "Describe the image decoded from brain signals.",
+        eeg_token: str = "<EEG>",
+        max_new_tokens: int = 128,
+        **kwargs,
     ):
-        """
-        EEG 生成流水线 (支持直连模式):
-        1. EEG -> SpatialMoEEncoder -> (Image_Feat, Text_Feat)
-        2. IF Q-Former: -> Q-Former -> EEG_Tokens
-           ELSE:        -> Linear Projector -> EEG_Tokens
-        3. EEG_Tokens + Text_Prompt -> Thinker (LLM)
-        """
         if self.eeg_encoder is None:
             raise ValueError("EEG components are not initialized.")
-
-        # 1. EEG Encoding
-        # eeg_input shape: [batch, channels, time] -> [1, 128, 512]
         emb_img, emb_txt, _ = self.eeg_encoder(eeg_input)
-        
-        # 2. Project to LLM Space
-        eeg_features = torch.stack([emb_img, emb_txt], dim=1) # [batch, 2, 512]
-
-        if getattr(self, 'use_qformer', False) and self.qformer is not None:
-            # Use Q-Former
-            eeg_llm_embeds = self.qformer(eeg_features, return_sequence=True)
-        elif self.eeg_projector is not None:
-            # Use Direct Linear Projection
-            # [batch, 2, 512] -> [batch, 2, hidden_size]
-            eeg_llm_embeds = self.eeg_projector(eeg_features)
+        if getattr(self, "use_qformer", False) and self.qformer is not None:
+            eeg_embed = self.qformer(torch.stack([emb_img, emb_txt], dim=1), return_sequence=False)
         else:
-             raise ValueError("No projection layer (Q-Former or Linear) found.")
-        
-        return eeg_llm_embeds
+            eeg_embed = self.eeg_projector(emb_txt)
+        if tokenizer is not None:
+            if eeg_token not in tokenizer.get_vocab():
+                tokenizer.add_tokens([eeg_token])
+                self.thinker.resize_token_embeddings(len(tokenizer))
+            eeg_tok_id = tokenizer.convert_tokens_to_ids(eeg_token)
+            self.thinker.config.eeg_token_index = eeg_tok_id
+            enc = tokenizer(prompt_text, return_tensors="pt")
+            input_ids = torch.cat([
+                torch.tensor([[eeg_tok_id]], dtype=torch.long, device=self.thinker.device),
+                enc["input_ids"].to(self.thinker.device),
+            ], dim=1)
+            generation = self.thinker.generate(
+                input_ids=input_ids,
+                eeg_embeds=eeg_embed.to(self.thinker.device),
+                max_new_tokens=max_new_tokens,
+                **kwargs,
+            )
+            gen_ids = generation[:, input_ids.size(1):]
+            return gen_ids
+        if "input_ids" in kwargs:
+            input_ids = kwargs["input_ids"].to(self.thinker.device)
+            if "eeg_token_index" in kwargs:
+                self.thinker.config.eeg_token_index = kwargs["eeg_token_index"]
+            generation = self.thinker.generate(
+                input_ids=input_ids,
+                eeg_embeds=eeg_embed.to(self.thinker.device),
+                max_new_tokens=max_new_tokens,
+                **kwargs,
+            )
+            return generation
+        raise ValueError("Provide a tokenizer or prebuilt input_ids to generate from EEG.")
 
     def forward(
         self,

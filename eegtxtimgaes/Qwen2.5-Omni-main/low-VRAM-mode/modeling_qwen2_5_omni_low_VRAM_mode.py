@@ -832,7 +832,7 @@ class Qwen2_5OmniSdpaAttention(Qwen2_5OmniAttention):
 
 QWEN2_5_OMNI_ATTENTION_CLASSES = {
     "eager": Qwen2_5OmniAttention,
-    "flash_attention_2": Qwen2_5OmniFlashAttention2,
+    # "flash_attention_2": Qwen2_5OmniFlashAttention2,
     "sdpa": Qwen2_5OmniSdpaAttention,
 }
 
@@ -1523,7 +1523,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 
                 self.audio_tower.to('cpu')
                 torch.cuda.empty_cache()
-
+#####################
             if eeg_embeds_text is not None and hasattr(self.config, "eeg_text_token_index"):
                 num_text_tokens = (input_ids == self.config.eeg_text_token_index).sum(dim=1)
                 if not torch.all(num_text_tokens == 1):
@@ -1562,7 +1562,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 )
                 eeg_embeds = eeg_embeds.to(inputs_embeds.device, inputs_embeds.dtype).unsqueeze(1)
                 inputs_embeds = inputs_embeds.masked_scatter(eeg_mask, eeg_embeds)
-
+###############
             if pixel_values is not None:
                 self.visual.to('cuda')
                 pixel_values = pixel_values.type(self.visual.dtype)
@@ -1787,7 +1787,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
 
     def set_input_embeddings(self, value):
         self.thinker.set_input_embeddings(value)
-
+#####
     def generate_from_eeg(
         self,
         eeg_input: torch.Tensor,
@@ -1843,6 +1843,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+############
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,

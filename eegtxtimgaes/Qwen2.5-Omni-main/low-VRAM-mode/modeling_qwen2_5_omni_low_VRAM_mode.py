@@ -656,7 +656,8 @@ class Qwen2_5OmniAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
+        self.rotary_emb = None
+        # self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
 
     def forward(
         self,
@@ -832,7 +833,7 @@ class Qwen2_5OmniSdpaAttention(Qwen2_5OmniAttention):
 
 QWEN2_5_OMNI_ATTENTION_CLASSES = {
     "eager": Qwen2_5OmniAttention,
-    "flash_attention_2": Qwen2_5OmniFlashAttention2,
+    # "flash_attention_2": Qwen2_5OmniFlashAttention2,
     "sdpa": Qwen2_5OmniSdpaAttention,
 }
 
@@ -957,7 +958,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         )
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
+        # self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1347,13 +1348,16 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     def __init__(self, config: Qwen2_5OmniThinkerConfig):
         super().__init__(config)
         print("========",config._attn_implementation)
-        self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(
-            config.audio_config, attn_implementation=config._attn_implementation
-        )
-
-        self.visual = Qwen2_5OmniVisionEncoder._from_config(
-            config.vision_config, attn_implementation=config._attn_implementation
-        )
+        ##############
+        self.audio_tower = None
+        # self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(
+        #     config.audio_config, attn_implementation=config._attn_implementation
+        # )
+################# 注释掉audio
+        self.visual = None
+        # self.visual = Qwen2_5OmniVisionEncoder._from_config(
+        #     config.vision_config, attn_implementation=config._attn_implementation
+        # )
         # EEG embeddings are provided externally; do not instantiate an encoder here.
         self.eeg_encoder = None
         # self.audio_tower.cpu()
@@ -1449,8 +1453,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         >>> response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         ```"""
-        self.visual.to('cpu')
-        self.audio_tower.to('cpu')
+        if self.visual is not None:
+            self.visual.to('cpu')
+        if self.audio_tower is not None:
+            self.audio_tower.to('cpu')
         torch.cuda.empty_cache()
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1496,7 +1502,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         # 2. Merge text , audios , image and video
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
-            if input_features is not None:
+            if input_features is not None and self.audio_tower is not None:
                 self.audio_tower.to('cuda')
                 audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
                     audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
@@ -1521,9 +1527,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
                 
-                self.audio_tower.to('cpu')
+                if self.audio_tower is not None:
+                    self.audio_tower.to('cpu')
                 torch.cuda.empty_cache()
-
+#####################
             if eeg_embeds_text is not None and hasattr(self.config, "eeg_text_token_index"):
                 num_text_tokens = (input_ids == self.config.eeg_text_token_index).sum(dim=1)
                 if not torch.all(num_text_tokens == 1):
@@ -1562,8 +1569,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 )
                 eeg_embeds = eeg_embeds.to(inputs_embeds.device, inputs_embeds.dtype).unsqueeze(1)
                 inputs_embeds = inputs_embeds.masked_scatter(eeg_mask, eeg_embeds)
-
-            if pixel_values is not None:
+###############
+            if pixel_values is not None and self.visual is not None:
                 self.visual.to('cuda')
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -1579,7 +1586,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 torch.cuda.empty_cache()
                 
 
-            if pixel_values_videos is not None:
+            if pixel_values_videos is not None and self.visual is not None:
                 self.visual.to('cuda')
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
                 video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
@@ -1740,35 +1747,27 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
 
         self.thinker = Qwen2_5OmniThinkerForConditionalGeneration(config.thinker_config)
 
-        self.has_talker = config.enable_audio_output
+        self.has_talker = False # config.enable_audio_output
         self.speaker_map = {}
-        if config.enable_audio_output:
-            self.enable_talker()
+        # if config.enable_audio_output:
+        #     self.enable_talker()
 
         # Initialize EEG components placeholders
         self.eeg_encoder = None
         self.qformer = None
         
         # Linear layer to project 512 (CLIP dim) -> Thinker Hidden Size
-        thinker_hidden_size = config.thinker_config.hidden_size
+        thinker_hidden_size = config.thinker_config.text_config.hidden_size
         self.eeg_projector = nn.Linear(512, thinker_hidden_size)
         
-        # Linear layer to project 512 (CLIP dim) -> Thinker Hidden Size
-        thinker_hidden_size = config.thinker_config.hidden_size
-        self.eeg_projector = nn.Linear(512, thinker_hidden_size)
+    # def enable_talker(self):
+    #     self.talker = Qwen2_5OmniTalkerForConditionalGeneration(self.config.talker_config)
+    #     self.token2wav = Qwen2_5OmniToken2WavModel(self.config.token2wav_config)
+    #     # self.token2wav.float()
+    #     self.token2wav.half()
+    #     # self.token2wav.cpu()
         
-        # Linear layer to project 512 (CLIP dim) -> Thinker Hidden Size
-        thinker_hidden_size = config.thinker_config.hidden_size
-        self.eeg_projector = nn.Linear(512, thinker_hidden_size)
-
-    def enable_talker(self):
-        self.talker = Qwen2_5OmniTalkerForConditionalGeneration(self.config.talker_config)
-        self.token2wav = Qwen2_5OmniToken2WavModel(self.config.token2wav_config)
-        # self.token2wav.float()
-        self.token2wav.half()
-        # self.token2wav.cpu()
-        
-        self.has_talker = True
+        self.has_talker = False
 
     def load_speakers(self, path):
         for key, value in torch.load(path).items():
@@ -1787,7 +1786,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
 
     def set_input_embeddings(self, value):
         self.thinker.set_input_embeddings(value)
-
+#####
     def generate_from_eeg(
         self,
         eeg_input: torch.Tensor,
@@ -1843,6 +1842,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+############
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,

@@ -20,6 +20,7 @@ import os
 # Add parent directory to path to import models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.clip_models import SpatialMoEEncoder
+from painter_sd import StableDiffusionPainter
 
 model_path = "Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"
 # model_path = snapshot_download(repo_id=model_path) # if you use local model file, delete this line
@@ -30,7 +31,7 @@ class Qwen25OmniThinkerGPTQ(BaseGPTQModel):
         "thinker.model.embed_tokens", 
         "thinker.model.norm", 
         # "token2wav", # Removed
-        "thinker.audio_tower", 
+        # "thinker.audio_tower", 
         "thinker.model.rotary_emb",
         "thinker.visual", 
         # "talker" # Removed
@@ -48,11 +49,11 @@ class Qwen25OmniThinkerGPTQ(BaseGPTQModel):
    
     def pre_quantize_generate_hook_start(self):
         self.thinker.visual = move_to(self.thinker.visual, device=self.quantize_config.device)
-        self.thinker.audio_tower = move_to(self.thinker.audio_tower, device=self.quantize_config.device)
+        # self.thinker.audio_tower = move_to(self.thinker.audio_tower, device=self.quantize_config.device)
 
     def pre_quantize_generate_hook_end(self):
         self.thinker.visual = move_to(self.thinker.visual, device=CPU)
-        self.thinker.audio_tower = move_to(self.thinker.audio_tower, device=CPU)
+        # self.thinker.audio_tower = move_to(self.thinker.audio_tower, device=CPU)
 
     def preprocess_dataset(self, sample: Dict) -> Dict:
         return sample
@@ -78,7 +79,7 @@ device_map = {
     "thinker.model": "cuda", 
     "thinker.lm_head": "cuda", 
     "thinker.visual": "cpu",  
-    "thinker.audio_tower": "cpu",  
+    # "thinker.audio_tower": "cpu",  
     # "talker": "cuda",  # Removed
     # "token2wav": "cuda",  # Removed
 }
@@ -116,6 +117,15 @@ model.model.eeg_projector = eeg_projector
 # model.model.tokenizer = processor.tokenizer 
 
 print("EEG Components Initialized.")
+
+# Initialize Stable Diffusion Painter
+print("Initializing Stable Diffusion Painter...")
+painter = StableDiffusionPainter(
+    model_id="runwayml/stable-diffusion-v1-5", # Or a local path
+    device="cuda",
+    torch_dtype=torch.float16,
+)
+print("Painter Initialized.")
 
 def eeg_inference(eeg_data, prompt_text="Describe the image decoded from brain signals."):
     """
@@ -157,6 +167,22 @@ try:
     response = eeg_inference(dummy_eeg, prompt_text="Please describe what you see.")
     print("\nGenerated Response:")
     print(response)
+    
+    # Generate Image from Response
+    print("\nGenerating Image from Response...")
+    image = painter.generate(
+        prompt=response,
+        negative_prompt="blurry, low quality, distorted",
+        num_inference_steps=25,
+        guidance_scale=7.5,
+        height=512,
+        width=512,
+        seed=42, # Fixed seed for reproducibility, remove for random
+    )
+    output_image_path = "./output_image_sd.png"
+    image.save(output_image_path)
+    print(f"Image saved to {output_image_path}")
+    
 except Exception as e:
     print(f"\nError during inference: {e}")
     import traceback

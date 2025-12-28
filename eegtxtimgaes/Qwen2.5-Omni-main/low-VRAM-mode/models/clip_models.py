@@ -130,21 +130,21 @@ class SpatialMoEEncoder(nn.Module):
                 # 过滤掉所有 decoder 相关的缺失键，因为我们不需要 Decoder
                 missing_keys = [k for k in msg.missing_keys if not k.startswith('decoder_') and not k.startswith('mask_token')]
             
-            # 打印结果
-            if len(missing_keys) > 0:
-                print(f">>> ⚠️ 注意：部分 Encoder 权重未加载 (Missing Keys): {missing_keys}")
-                # 只有当核心 Encoder 层缺失时才报严重警告
-                if any("blocks" in k for k in missing_keys) or any("patch_embed" in k for k in missing_keys):
-                    print("!!! 严重警告：核心 Encoder Block 缺失！请检查前缀！")
+                # 打印结果
+                if len(missing_keys) > 0:
+                    print(f">>> ⚠️ 注意：部分 Encoder 权重未加载 (Missing Keys): {missing_keys}")
+                    # 只有当核心 Encoder 层缺失时才报严重警告
+                    if any("blocks" in k for k in missing_keys) or any("patch_embed" in k for k in missing_keys):
+                        print("!!! 严重警告：核心 Encoder Block 缺失！请检查前缀！")
+                    else:
+                        print(">>> (这些缺失可能不影响 Encoder 功能，如 head 等)")
                 else:
-                    print(">>> (这些缺失可能不影响 Encoder 功能，如 head 等)")
-            else:
-                print(">>> ✅ 完美！所有 Encoder 核心权重均已加载！")
+                    print(">>> ✅ 完美！所有 Encoder 核心权重均已加载！")
 
-            # 确认 Decoder 确实被忽略了
-            decoder_missing = [k for k in msg.missing_keys if k.startswith('decoder_')]
-            if len(decoder_missing) > 0:
-                print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
+                # 确认 Decoder 确实被忽略了
+                decoder_missing = [k for k in msg.missing_keys if k.startswith('decoder_')]
+                if len(decoder_missing) > 0:
+                    print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
 
             
             # (可选) 冻结主干，只训练后面的 Router 和 Heads，节省显存

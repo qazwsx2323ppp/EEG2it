@@ -7,8 +7,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2.5-Omni-7B",
     torch_dtype=torch.float16 if device=="cuda" else torch.float32,
-    attn_implementation="sdpa"
-).to(device).eval()
+    attn_implementation="sdpa",
+    device_map="auto",
+    low_cpu_mem_usage=True
+).eval()
 
 processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-7B")
 tokenizer = processor.tokenizer
@@ -21,7 +23,7 @@ eeg_encoder = SpatialMoEEncoder(
     pretrained_path=r"D:\ASUS\eegtxtimgaes\Qwen2.5-Omni-main\low-VRAM-mode\best_12.8_change.pth"
 ).to(device).eval()
 
-thinker_hidden = model.config.thinker_config.hidden_size
+thinker_hidden = model.config.thinker_config.text_config.hidden_size
 eeg_projector = torch.nn.Linear(512, thinker_hidden).to(device)
 
 model.eeg_encoder = eeg_encoder

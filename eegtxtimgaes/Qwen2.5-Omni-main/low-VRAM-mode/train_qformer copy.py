@@ -11,8 +11,7 @@ from omegaconf import OmegaConf
 
 from dataset import TripletDataset
 from transformers import Qwen2_5OmniProcessor
-# from modeling_qwen2_5_omni_low_VRAM_mode import Qwen2_5OmniForConditionalGeneration
-from external.modeling_qwen2_5_omni_costom import Qwen2_5OmniForConditionalGeneration
+from modeling_qwen2_5_omni_low_VRAM_mode import Qwen2_5OmniForConditionalGeneration
 from models.clip_models import SpatialMoEEncoder
 from out_qformer import EEGQFormer
 
@@ -44,26 +43,10 @@ def train_qformer():
         "Qwen/Qwen2.5-Omni-7B",
         torch_dtype=torch.float32, # 临时改为 float32 避免精度问题
         device_map="auto"
-    )
-    # 显式禁用音频模块以节省显存 (我们只需要 Thinker/LLM 部分)
-    if hasattr(model, "disable_talker"):
-        model.disable_talker()
-    
-    model.eval()
+    ).eval()
     
     for param in model.parameters():
         param.requires_grad = False
-    
-    # 禁用缓存以确保训练反向传播到 inputs_embeds
-    try:
-        model.config.use_cache = False
-    except Exception:
-        pass
-    try:
-        if hasattr(model, "thinker") and hasattr(model.thinker, "config"):
-            model.thinker.config.use_cache = False
-    except Exception:
-        pass
         
   
     eeg_encoder = SpatialMoEEncoder(
@@ -79,13 +62,11 @@ def train_qformer():
     # C. Q-Former (训练目标) - 激活
     thinker_hidden_size = model.config.thinker_config.text_config.hidden_size
     qformer = EEGQFormer(
-        hidden_size=thinker_hidden_size,
-        kv_dim=1024,
-        num_queries=16,
+        hidden_size=thinker_hidden_size, # 3584
+        kv_dim=512,                      # EEG Encoder 输出维度
+        num_queries=16,                  # 生成 16 个 Query Token
         num_layers=2,
-        num_heads=8,
-        dropout=0.1,
-        resid_scale=0.5
+        num_heads=8
     ).to(device).train()
     
 
@@ -106,7 +87,6 @@ def train_qformer():
     
     for epoch in range(epochs):
         total_loss = 0
-        processed_batches = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         
         for batch_idx, batch in enumerate(pbar):
@@ -125,45 +105,36 @@ def train_qformer():
                 # Encoder 返回 (img_emb, txt_emb, weights)
                 emb_img, emb_txt, _ = eeg_encoder(eeg_signal)
                 
-            kv_tokens = eeg_encoder.get_patch_tokens(eeg_signal)
-            eeg_embeds = qformer(kv_tokens, return_sequence=True)
+            # 2. 准备 Q-Former 输入
+            # 将 img 和 txt 特征堆叠作为 KV
+            # shape: (Batch, 2, 512)
+            kv_tokens = torch.stack([emb_img, emb_txt], dim=1)
+            
+            # 3. Q-Former 前向传播
+            # 返回: (Batch, num_queries, Hidden)
+            eeg_embeds = qformer(kv_tokens, return_sequence=True) # 必须 return_sequence=True
             
             # 4. 构建 LLM 输入
-            # 4. 构建 LLM 输入嵌入（对齐设备）
-            embed_layer = model.thinker.get_input_embeddings()
-            embed_device = next(embed_layer.parameters()).device
-            text_inputs = tokenizer(text_captions, return_tensors="pt", padding=True, truncation=True, max_length=128)
-            text_input_ids = text_inputs.input_ids.to(embed_device)
-            text_attn_mask = text_inputs.attention_mask.to(embed_device)
-            text_token_embeds = embed_layer(text_input_ids)
-            
-            # 将 EEG 查询对齐到同一设备
-            eeg_embeds = eeg_embeds.to(embed_device)
+            text_inputs = tokenizer(text_captions, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+            text_token_embeds = model.get_input_embeddings()(text_inputs.input_ids)
             
             # 拼接: [EEG_Embeds, Text_Embeds]
             inputs_embeds = torch.cat([eeg_embeds, text_token_embeds], dim=1)
             
             # 5. 构建 Labels 和 Attention Mask
+            # EEG 部分设为 -100
             batch_size_curr = inputs_embeds.shape[0]
-            num_eeg_tokens = eeg_embeds.shape[1]  # num_queries
+            num_eeg_tokens = eeg_embeds.shape[1] # num_queries
             
-            # Label 部分（EEG 设为 -100, 文本的 PAD 位置也设为 -100）
-            ignore_labels = torch.full((batch_size_curr, num_eeg_tokens), -100, dtype=torch.long, device=embed_device)
-            labels = torch.cat([ignore_labels, text_input_ids], dim=1)
-            labels_text = labels[:, num_eeg_tokens:]
-            labels_text[text_attn_mask == 0] = -100
-            # 忽略 BOS，避免在序列首位置产生不稳定梯度
-            try:
-                labels_text[:, 0] = -100
-            except Exception:
-                pass
-            labels[:, num_eeg_tokens:] = labels_text
+            # Label 部分
+            ignore_labels = torch.full((batch_size_curr, num_eeg_tokens), -100, dtype=torch.long, device=device)
+            labels = torch.cat([ignore_labels, text_inputs.input_ids], dim=1)
             
             # Mask 部分
-            eeg_attention_mask = torch.ones((batch_size_curr, num_eeg_tokens), dtype=torch.long, device=embed_device)
-            attention_mask = torch.cat([eeg_attention_mask, text_attn_mask], dim=1)
-            # 显式构建 position_ids，确保与拼接后的长度一致
-            position_ids = torch.arange(inputs_embeds.size(1), device=embed_device).unsqueeze(0).expand(batch_size_curr, -1)
+            # EEG tokens 都是有效的，所以 mask 是 1
+            eeg_attention_mask = torch.ones((batch_size_curr, num_eeg_tokens), dtype=torch.long, device=device)
+            # 拼接: [EEG_Mask, Text_Mask]
+            attention_mask = torch.cat([eeg_attention_mask, text_inputs.attention_mask], dim=1)
             
             # 6. 计算 Loss
             # --- DEBUG START ---
@@ -178,8 +149,7 @@ def train_qformer():
                     print("[ERROR] Input Embeds contains NaN!")
             # --- DEBUG END ---
 
-            # 直接调用 model.thinker 进行前向传播，因为顶层 Wrapper 可能没有实现 forward
-            outputs = model.thinker(inputs_embeds=inputs_embeds, attention_mask=attention_mask, position_ids=position_ids, labels=labels)
+            outputs = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
             
             # --- DEBUG LOSS ---
@@ -189,19 +159,12 @@ def train_qformer():
             
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(qformer.parameters(), 1.0)
-            if batch_idx == 0:
-                grad_norm = 0.0
-                for p in qformer.parameters():
-                    if p.grad is not None:
-                        grad_norm += p.grad.data.norm().item()
-                print(f"[DEBUG] Q-Former grad norm: {grad_norm:.4f}")
             optimizer.step()
-            processed_batches += 1
+            
             total_loss += loss.item()
             pbar.set_postfix({"loss": loss.item()})
             
-        avg_loss = total_loss / max(processed_batches, 1)
+        avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
         
         # 保存

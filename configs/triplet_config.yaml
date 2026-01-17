@@ -40,7 +40,7 @@ training:
   alpha: 0.5
 
   # InfoNCE 损失函数的温度参数
-  temperature: 0.1
+  temperature: 0.2
 
 # 5. EEG 编码器模型参数
 #    这些参数来自 EEG-CLIP 仓库，您可以直接使用
@@ -48,7 +48,7 @@ model:
   model_name: 'eeg_moe'  # 更改名称以区分
   
   # [新增] Checkpoint 路径 (请修改为你存放 .pth 的真实路径)
-  pretrained_path: 'models/dreamdiffusion_pretrain/checkpoint.pth'
+  pretrained_path: 'checkpoint.pth'
 
   # EEG 编码器参数
   n_linear_layers: 1

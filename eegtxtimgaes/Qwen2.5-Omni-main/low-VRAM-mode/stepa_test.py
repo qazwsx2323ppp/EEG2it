@@ -4,7 +4,7 @@ import os
 from omegaconf import OmegaConf
 
 # Add parent directory to sys.path to allow importing dataset.py from root
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from dataset import TripletDataset
 
 from transformers import Qwen2_5OmniProcessor

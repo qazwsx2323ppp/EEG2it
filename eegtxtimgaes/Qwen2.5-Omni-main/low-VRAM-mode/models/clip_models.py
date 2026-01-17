@@ -272,3 +272,8 @@ class SpatialMoEEncoder(nn.Module):
             "w_vis_img": g_vis_img.mean(), 
             "w_sem_txt": g_sem_txt.mean()
         }
+
+    def get_patch_tokens(self, x):
+        x_padded = x
+        latent, _, _ = self.backbone.forward_encoder(x_padded, mask_ratio=0.0)
+        return latent[:, 1:, :]

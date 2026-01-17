@@ -113,6 +113,7 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
 
         # --- 【修改】 混合精度反向传播 ---
         scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         
@@ -135,6 +136,140 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
             avg_weights[k] = total_weights[k] / len(dataloader)
             
     return avg_loss, avg_loss_img, avg_loss_txt, avg_weights
+
+# 添加到 main.py 中
+
+def compute_retrieval_metrics(eeg_embeddings, target_embeddings, k_values=[1, 5, 10]):
+    """
+    计算检索准确率
+    """
+    # 计算余弦相似度矩阵
+    similarity_matrix = torch.matmul(eeg_embeddings, target_embeddings.T)
+    
+    # 获取排序后的索引
+    _, sorted_indices = torch.sort(similarity_matrix, dim=1, descending=True)
+    
+    # 创建正确标签
+    correct_labels = torch.arange(similarity_matrix.shape[0], 
+                                  device=similarity_matrix.device)
+    
+    metrics = {}
+    for k in k_values:
+        top_k_indices = sorted_indices[:, :k]
+        hits = (top_k_indices == correct_labels.unsqueeze(1)).any(dim=1)
+        accuracy = hits.float().mean().item()
+        metrics[f"top_{k}_accuracy"] = accuracy
+    
+    # 计算平均相似度
+    positive_sim = torch.diag(similarity_matrix).mean().item()
+    
+    # 计算负样本相似度（非对角线元素）
+    mask = ~torch.eye(similarity_matrix.shape[0], 
+                     dtype=torch.bool, 
+                     device=similarity_matrix.device)
+    negative_sim = similarity_matrix[mask].mean().item()
+    
+    metrics['mean_positive_similarity'] = positive_sim
+    metrics['mean_negative_similarity'] = negative_sim
+    metrics['separation_ratio'] = positive_sim / (negative_sim + 1e-8)
+    
+    return metrics
+
+
+def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha):
+    """
+    增强的验证函数，包含更多指标
+    """
+    model.eval()
+    total_loss_val = 0.0
+    total_loss_val_img = 0.0
+    total_loss_val_txt = 0.0
+    
+    all_eeg_img_embeddings = []
+    all_eeg_txt_embeddings = []
+    all_target_img_embeddings = []
+    all_target_txt_embeddings = []
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validation"):
+            eeg_signals, image_vecs, text_vecs = batch
+            
+            eeg_signals = eeg_signals.to(device)
+            image_vecs = image_vecs.to(device)
+            text_vecs = text_vecs.to(device)
+            
+            outputs = model(eeg_signals)
+            
+            if len(outputs) == 3:
+                eeg_img_embedding, eeg_txt_embedding, _ = outputs
+            else:
+                eeg_img_embedding, eeg_txt_embedding = outputs
+            
+            loss_img = loss_fn_img(eeg_img_embedding, image_vecs)
+            loss_txt = loss_fn_txt(eeg_txt_embedding, text_vecs)
+            loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
+            
+            total_loss_val += loss.item()
+            total_loss_val_img += loss_img.item()
+            total_loss_val_txt += loss_txt.item()
+            
+            # 收集所有嵌入向量用于计算检索指标
+            all_eeg_img_embeddings.append(eeg_img_embedding.cpu())
+            all_eeg_txt_embeddings.append(eeg_txt_embedding.cpu())
+            all_target_img_embeddings.append(image_vecs.cpu())
+            all_target_txt_embeddings.append(text_vecs.cpu())
+    
+    # 合并所有batch
+    all_eeg_img = torch.cat(all_eeg_img_embeddings, dim=0).to(device)
+    all_eeg_txt = torch.cat(all_eeg_txt_embeddings, dim=0).to(device)
+    all_target_img = torch.cat(all_target_img_embeddings, dim=0).to(device)
+    all_target_txt = torch.cat(all_target_txt_embeddings, dim=0).to(device)
+    
+    # 计算检索指标
+    img_metrics = compute_retrieval_metrics(all_eeg_img, all_target_img)
+    txt_metrics = compute_retrieval_metrics(all_eeg_txt, all_target_txt)
+    
+    avg_loss_val = total_loss_val / len(dataloader)
+    avg_loss_val_img = total_loss_val_img / len(dataloader)
+    avg_loss_val_txt = total_loss_val_txt / len(dataloader)
+    
+    return {
+        'loss': avg_loss_val,
+        'loss_img': avg_loss_val_img,
+        'loss_txt': avg_loss_val_txt,
+        'img_metrics': img_metrics,
+        'txt_metrics': txt_metrics
+    }
+
+
+def check_parameter_updates(model, optimizer):
+    """
+    检查参数是否在更新（用于验证微调是否生效）
+    """
+    trainable_params = []
+    frozen_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            trainable_params.append((name, param.numel()))
+        else:
+            frozen_params.append((name, param.numel()))
+    
+    total_trainable = sum(p[1] for p in trainable_params)
+    total_frozen = sum(p[1] for p in frozen_params)
+    
+    print(f"\n【参数更新检查】")
+    print(f"可训练参数: {total_trainable:,} ({total_trainable/(total_trainable+total_frozen)*100:.1f}%)")
+    print(f"冻结参数: {total_frozen:,} ({total_frozen/(total_trainable+total_frozen)*100:.1f}%)")
+    print(f"\n可训练参数示例（前5个）:")
+    for name, numel in trainable_params[:5]:
+        print(f"  - {name}: {numel:,}")
+    
+    return {
+        'trainable_count': total_trainable,
+        'frozen_count': total_frozen,
+        'trainable_ratio': total_trainable / (total_trainable + total_frozen)
+    }
 
 
 def validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha):
@@ -200,8 +335,8 @@ def main(cfg: DictConfig):
     model = SpatialMoEEncoder(
         n_channels=cfg.model.n_channels,
         n_samples=cfg.model.n_samples,
-        visual_indices=cfg.model.moe_config.visual_indices,
-        semantic_indices=cfg.model.moe_config.semantic_indices,
+        # visual_indices=cfg.model.moe_config.visual_indices,
+        # semantic_indices=cfg.model.moe_config.semantic_indices,
         embedding_dim=cfg.model.embedding_dim,
         pretrained_path=cfg.model.get("pretrained_path", None) # 确保从 Config 读取路径
     ).to(device)
@@ -298,7 +433,7 @@ def main(cfg: DictConfig):
             # CLIP 官方对这个参数通常不使用 weight decay
             {"params": loss_params, "lr": cfg.training.learning_rate, "weight_decay": 0.0},
         ],
-        weight_decay=0.1
+        weight_decay=0.15
     )
 
     # --- 【新增】 学习率调度器 ---
@@ -315,7 +450,13 @@ def main(cfg: DictConfig):
 
     # --- 【新增】 混合精度 Scaler ---
     scaler = GradScaler()
+    param_info = check_parameter_updates(model, optimizer)
 
+    wandb.log({
+        "trainable_params": param_info['trainable_count'],
+        "frozen_params": param_info['frozen_count'],
+        "trainable_ratio": param_info['trainable_ratio']
+    })
     # 4. 训练循环
     print("开始训练...")
     best_val_loss = float('inf')
@@ -347,18 +488,63 @@ def main(cfg: DictConfig):
             cfg.training.alpha, scaler, scheduler
         )
 
-        avg_loss_val, avg_loss_val_img, avg_loss_val_txt = validate(
+        val_results = enhanced_validate(
             model, val_loader, loss_fn_img, loss_fn_txt, device, cfg.training.alpha
         )
 
-        # 获取当前学习率用于记录
+        avg_loss_val = val_results['loss']
+        avg_loss_val_img = val_results['loss_img']
+        avg_loss_val_txt = val_results['loss_txt']
+
+        # 获取当前学习率用于记录（修复：添加这行）
         current_lr = optimizer.param_groups[0]["lr"]
 
+        # === 【增强】 详细的训练效果展示 ===
+        print(f"\n{'='*70}")
         print(f"Epoch {epoch + 1}/{cfg.training.epochs} | LR: {current_lr:.6f}")
-        print(f"  Train Loss: {avg_loss:.4f} | Val Loss: {avg_loss_val:.4f}")
-        print(f"  Train Img Loss: {avg_loss_img:.4f} | Val Img Loss: {avg_loss_val_img:.4f}")
+        print(f"{'='*70}")
+        
+        # 损失指标
+        print(f"\n【损失指标】")
+        print(f"  训练损失: {avg_loss:.4f} (图像: {avg_loss_img:.4f}, 文本: {avg_loss_txt:.4f})")
+        print(f"  验证损失: {avg_loss_val:.4f} (图像: {avg_loss_val_img:.4f}, 文本: {avg_loss_val_txt:.4f})")
+        
+        # 图像检索指标
+        img_metrics = val_results['img_metrics']
+        print(f"\n【图像检索效果】")
+        print(f"  Top-1 准确率: {img_metrics['top_1_accuracy']*100:.2f}%")
+        print(f"  Top-5 准确率: {img_metrics['top_5_accuracy']*100:.2f}%")
+        print(f"  Top-10 准确率: {img_metrics['top_10_accuracy']*100:.2f}%")
+        print(f"  正样本平均相似度: {img_metrics['mean_positive_similarity']:.4f}")
+        print(f"  负样本平均相似度: {img_metrics['mean_negative_similarity']:.4f}")
+        print(f"  分离比 (正/负): {img_metrics['separation_ratio']:.4f}")
+        
+        # 文本检索指标
+        txt_metrics = val_results['txt_metrics']
+        print(f"\n【文本检索效果】")
+        print(f"  Top-1 准确率: {txt_metrics['top_1_accuracy']*100:.2f}%")
+        print(f"  Top-5 准确率: {txt_metrics['top_5_accuracy']*100:.2f}%")
+        print(f"  Top-10 准确率: {txt_metrics['top_10_accuracy']*100:.2f}%")
+        print(f"  正样本平均相似度: {txt_metrics['mean_positive_similarity']:.4f}")
+        print(f"  负样本平均相似度: {txt_metrics['mean_negative_similarity']:.4f}")
+        print(f"  分离比 (正/负): {txt_metrics['separation_ratio']:.4f}")
+        
+        # 训练健康度检查
+        if epoch == 0 or (epoch + 1) % 5 == 0:
+            print(f"\n【训练健康度】")
+            if img_metrics['separation_ratio'] > 1.5 and txt_metrics['separation_ratio'] > 1.5:
+                print(f"  ✅ 分离比良好，模型正在学习区分正负样本")
+            else:
+                print(f"  ⚠️  分离比较低，可能需要调整学习率或检查数据")
+            
+            if img_metrics['top_1_accuracy'] > 0.1 or txt_metrics['top_1_accuracy'] > 0.1:
+                print(f"  ✅ 检索准确率 > 10%，模型表现正常")
+            else:
+                print(f"  ⚠️  检索准确率较低，模型可能还在学习初期")
+        
+        print(f"{'='*70}\n")
 
-        # 记录到 WandB
+        # 记录到WandB
         log_dict = {
             "epoch": epoch,
             "learning_rate": current_lr,
@@ -367,10 +553,31 @@ def main(cfg: DictConfig):
             "train_loss_text": avg_loss_txt,
             "val_loss_total": avg_loss_val,
             "val_loss_image": avg_loss_val_img,
-            "val_loss_text": avg_loss_val_txt
+            "val_loss_text": avg_loss_val_txt,
+            # 图像检索指标
+            "val_img_top1": img_metrics['top_1_accuracy'],
+            "val_img_top5": img_metrics['top_5_accuracy'],
+            "val_img_top10": img_metrics['top_10_accuracy'],
+            "val_img_pos_sim": img_metrics['mean_positive_similarity'],
+            "val_img_neg_sim": img_metrics['mean_negative_similarity'],
+            "val_img_separation": img_metrics['separation_ratio'],
+            # 文本检索指标
+            "val_txt_top1": txt_metrics['top_1_accuracy'],
+            "val_txt_top5": txt_metrics['top_5_accuracy'],
+            "val_txt_top10": txt_metrics['top_10_accuracy'],
+            "val_txt_pos_sim": txt_metrics['mean_positive_similarity'],
+            "val_txt_neg_sim": txt_metrics['mean_negative_similarity'],
+            "val_txt_separation": txt_metrics['separation_ratio'],
         }
         if avg_weights:
             log_dict.update(avg_weights)
+            print(f"\n【MoE权重分布】")
+            print(f"  视觉专家权重: {avg_weights.get('w_vis_img', 0):.4f}")
+            print(f"  语义专家权重: {avg_weights.get('w_sem_txt', 0):.4f}")
+            
+            # 检查权重是否正常（应该在0-1之间，且不应该极端）
+            if avg_weights.get('w_vis_img', 0) < 0.1 or avg_weights.get('w_vis_img', 0) > 0.9:
+                print(f"  ⚠️  视觉专家权重异常，MoE可能没有正常工作")
         
         wandb.log(log_dict)
 

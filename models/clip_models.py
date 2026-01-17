@@ -216,11 +216,20 @@ class SpatialMoEEncoder(nn.Module):
         g_sem_txt = gates[:, 2:3]
         g_fus_txt = gates[:, 3:4]
 
-        # # 归一化权重
-        g_vis_img = g_vis_img / (g_vis_img + g_fus_img + 1e-6)
-        g_fus_img = g_fus_img / (g_vis_img + g_fus_img + 1e-6)
-        g_sem_txt = g_sem_txt / (g_sem_txt + g_fus_txt + 1e-6)
-        g_fus_txt = g_fus_txt / (g_sem_txt + g_fus_txt + 1e-6)
+        # # # 归一化权重
+        # g_vis_img = g_vis_img / (g_vis_img + g_fus_img + 1e-6)
+        # g_fus_img = g_fus_img / (g_vis_img + g_fus_img + 1e-6)
+        # g_sem_txt = g_sem_txt / (g_sem_txt + g_fus_txt + 1e-6)
+        # g_fus_txt = g_fus_txt / (g_sem_txt + g_fus_txt + 1e-6)
+        # 图像权重归一化
+        img_sum = g_vis_img + g_fus_img + 1e-6
+        g_vis_img = g_vis_img / img_sum
+        g_fus_img = g_fus_img / img_sum
+
+        # 文本权重归一化
+        txt_sum = g_sem_txt + g_fus_txt + 1e-6
+        g_sem_txt = g_sem_txt / txt_sum
+        g_fus_txt = g_fus_txt / txt_sum
 
         # # 4. 专家前向传播 (现在是轻量级 Adapter)
         # # 这里的“思想”是：虽然特征是共享的，但不同的 Head 负责提取不同的信息

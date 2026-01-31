@@ -20,6 +20,7 @@ import os
 # Add parent directory to path to import models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.clip_models import SpatialMoEEncoder
+from out_qformer import EEGQFormer
 from painter_sd import StableDiffusionPainter
 
 model_path = "Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"
@@ -105,10 +106,51 @@ eeg_encoder = SpatialMoEEncoder(
     # pretrained_path="path/to/dreamdiffusion/checkpoint.pt" # Optional
 ).to("cuda").half() # Use half precision to match model
 
+# Optional: load a trained EEG encoder checkpoint (state_dict of SpatialMoEEncoder)
+eeg_encoder_ckpt = os.environ.get("EEG_ENCODER_CKPT", "").strip()
+if eeg_encoder_ckpt:
+    if not os.path.exists(eeg_encoder_ckpt):
+        raise FileNotFoundError(f"EEG_ENCODER_CKPT not found: {eeg_encoder_ckpt}")
+    print(f"Loading EEG encoder weights from: {eeg_encoder_ckpt}")
+    state = torch.load(eeg_encoder_ckpt, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    missing, unexpected = eeg_encoder.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[EEG Encoder] Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"[EEG Encoder] Unexpected keys: {len(unexpected)}")
+
 # Initialize Projector (Linear: 512 -> Hidden Size)
 # This aligns the EEG embedding dimension with the Thinker's hidden size
 thinker_hidden_size = model.config.thinker_config.hidden_size
 eeg_projector = torch.nn.Linear(512, thinker_hidden_size).to("cuda").half()
+
+# Optional: load a trained Q-Former checkpoint and use it as an EEG->Thinker bridge.
+# This path should point to the `eeg_qformer.pth` saved by `train_qformer.py`.
+qformer = None
+qformer_ckpt = os.environ.get("EEG_QFORMER_CKPT", "eeg_qformer.pth").strip()
+use_qformer = os.environ.get("USE_QFORMER", "1").strip().lower() not in {"0", "false", "no"}
+if use_qformer and qformer_ckpt and os.path.exists(qformer_ckpt):
+    num_queries = int(os.environ.get("EEG_QFORMER_NUM_QUERIES", "16"))
+    num_layers = int(os.environ.get("EEG_QFORMER_NUM_LAYERS", "2"))
+    num_heads = int(os.environ.get("EEG_QFORMER_NUM_HEADS", "8"))
+    print(f"Loading Q-Former weights from: {qformer_ckpt}")
+    qformer = EEGQFormer(
+        hidden_size=thinker_hidden_size,
+        kv_dim=1024,
+        num_queries=num_queries,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        dropout=0.1,
+        resid_scale=0.5,
+    ).to("cuda").half().eval()
+    qformer.load_state_dict(torch.load(qformer_ckpt, map_location="cpu"))
+    model.model.qformer = qformer
+    model.model.use_qformer = True
+    print("Q-Former enabled (EEG prefix tokens).")
+else:
+    print("Q-Former disabled (fallback to linear EEG projector).")
 
 # Attach components to the model
 model.model.eeg_encoder = eeg_encoder
@@ -155,6 +197,68 @@ def eeg_inference(eeg_data, prompt_text="Describe the image decoded from brain s
     return response
 
 
+def eeg_inference_qformer_prefix(
+    eeg_data,
+    prompt_text="Describe the image decoded from brain signals.",
+    max_new_tokens=128,
+    do_sample=True,
+    temperature=0.7,
+    top_p=0.9,
+):
+    """
+    Use Q-Former to generate a *sequence* of EEG prefix tokens, then prepend them to the Thinker input.
+
+    This matches the training pattern in `train_qformer.py` (prefixing inputs_embeds), and avoids the
+    single-<EEG>-token constraint in the low-VRAM modeling wrapper.
+    """
+    if qformer is None:
+        raise ValueError("Q-Former is not initialized. Set EEG_QFORMER_CKPT to a valid checkpoint path.")
+
+    print(f"Input EEG Data Shape: {eeg_data.shape}")
+    eeg_data = eeg_data.to("cuda").half()
+
+    with torch.no_grad():
+        kv_tokens = eeg_encoder.get_patch_tokens(eeg_data)  # [B, N, 1024]
+        eeg_prefix = qformer(kv_tokens, return_sequence=True)  # [B, Q, hidden]
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt_text},
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=text, return_tensors="pt", padding=True)
+
+    input_ids = inputs.input_ids.to("cuda")
+    text_attention_mask = inputs.attention_mask.to("cuda")
+
+    embed_layer = model.model.thinker.get_input_embeddings()
+    text_token_embeds = embed_layer(input_ids).to(eeg_prefix.dtype)
+
+    final_embeds = torch.cat([eeg_prefix, text_token_embeds], dim=1)
+    eeg_attention_mask = torch.ones((input_ids.size(0), eeg_prefix.size(1)), dtype=text_attention_mask.dtype, device="cuda")
+    attention_mask = torch.cat([eeg_attention_mask, text_attention_mask], dim=1)
+    position_ids = torch.arange(final_embeds.size(1), device="cuda").unsqueeze(0).expand(final_embeds.size(0), -1)
+
+    # Provide dummy IDs for the EEG prefix so generate() can infer prompt length.
+    eos_id = processor.tokenizer.eos_token_id or 0
+    eeg_dummy_ids = torch.full((input_ids.size(0), eeg_prefix.size(1)), eos_id, dtype=input_ids.dtype, device="cuda")
+    full_input_ids = torch.cat([eeg_dummy_ids, input_ids], dim=1)
+
+    output_ids = model.generate(
+        input_ids=full_input_ids,
+        inputs_embeds=final_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    gen_ids = output_ids[:, full_input_ids.size(1) :]
+    response = processor.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0]
+    return response
+
+
 # --- Demo Execution ---
 # Create dummy EEG data [Batch, Channels, Time]
 dummy_eeg = torch.randn(1, 128, 512) 
@@ -164,7 +268,10 @@ torch.cuda.reset_peak_memory_stats()
 start = time.time()
 
 try:
-    response = eeg_inference(dummy_eeg, prompt_text="Please describe what you see.")
+    if qformer is not None:
+        response = eeg_inference_qformer_prefix(dummy_eeg, prompt_text="Please describe what you see.")
+    else:
+        response = eeg_inference(dummy_eeg, prompt_text="Please describe what you see.")
     print("\nGenerated Response:")
     print(response)
     

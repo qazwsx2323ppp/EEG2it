@@ -1,0 +1,79 @@
+# configs/ds003825_triplet_config.yaml
+#
+# 用 ds003825 (THINGS RSVP EEG, BIDS) 做三元组训练的示例配置：
+# - eeg_path 指向 BIDS 根目录（包含 dataset_description.json）
+# - 由于 ds003825 在 OpenNeuro 里通常不包含 stimuli/ 图片，推荐先用“概念级”向量：
+#     utils/ds003825_embed_concepts.py 生成 [1854, 512] 的 text 向量，并可选择 image 向量= text 向量
+
+defaults:
+  - _self_
+  - override hydra/launcher: slurm
+
+wandb:
+  project: "EEG_Decoupling"
+  entity: null
+  name: "eeg_triplet_train_ds003825"
+
+data:
+  root: ${hydra:runtime.cwd}
+  split_index: 0
+
+  # 关键：指向 BIDS 根目录（这里用你的“全量数据”路径）
+  backend: "ds003825"
+  eeg_path: ${data.root}/data/ds003825
+
+  # 概念级向量（objectnumber 0..1853），推荐先用 text-only 方案：
+  #  - out-text 生成到 data/ds003825_concept_text.npy
+  #  - out-image 可选生成到 data/ds003825_concept_image.npy (与 text 相同)
+  image_vec_path: ${data.root}/data/ds003825_concept_image.npy
+  text_vec_path: ${data.root}/data/ds003825_concept_text.npy
+
+  # 可选：你也可以提供 splits_path（splits['splits'][split_index][train/val/test]），否则默认按 subject 划分
+  splits_path: ""
+
+  # ds003825 专用开关
+  target_channels: 128
+  include_teststim: false
+  include_targets: false
+  trial_stride: 1        # 每隔 N 条取 1 条，先做加速/降规模；想用全量就设为 1
+  drop_exclude_flagged: true
+  # subjects: "sub-02,sub-03"   # 可选：只用部分被试
+  # exclude_subjects: "sub-01,sub-06,sub-18,sub-23"
+
+training:
+  epochs: 50
+  batch_size: 64
+  learning_rate: 0.0001
+  num_workers: 4
+  device: "cuda"
+  patience: 10
+  min_delta: 0.01
+  weight_decay: 0.1
+  alpha: 0.0            # 只用 text loss（因为 image_vec 可能等于 text_vec）
+  temperature: 0.2
+
+model:
+  model_name: 'eeg_moe'
+  pretrained_path: 'checkpoint.pth'
+  n_linear_layers: 1
+  channel_merge: 'linear'
+  n_heads: 8
+  embedding_dim: 512
+  n_channels: 128
+  n_samples: 512
+  encoder_name: 'braindecode_shallow'
+
+  moe_config:
+    router_type: "global_channel_attention"
+
+  n_filters_time: 20
+  filter_time_length: 25
+  n_filters_spat: 20
+  pool_time_length: 75
+  pool_time_stride: 15
+  drop_prob: 0.6
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+

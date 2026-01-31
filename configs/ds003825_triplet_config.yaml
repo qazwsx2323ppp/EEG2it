@@ -54,7 +54,7 @@ training:
 
 model:
   model_name: 'eeg_moe'
-  pretrained_path: 'checkpoint.pth'
+  pretrained_path: '${data.root}/temp/checkpoint.pth'
   n_linear_layers: 1
   channel_merge: 'linear'
   n_heads: 8

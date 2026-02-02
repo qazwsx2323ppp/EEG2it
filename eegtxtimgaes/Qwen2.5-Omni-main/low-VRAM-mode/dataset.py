@@ -10,6 +10,12 @@ from scipy.interpolate import interp1d
 
 _DS003825_INDEX_CACHE = {}
 
+def _is_rank0() -> bool:
+    try:
+        return int(os.environ.get("RANK", "0")) == 0
+    except Exception:
+        return True
+
 def _is_bids_root(path: str) -> bool:
     if not path or not os.path.isdir(path):
         return False
@@ -132,7 +138,8 @@ class TripletDataset(Dataset):
     def __init__(self, cfg_data, mode='train', split_index=0, return_text=False):
         self.mode = mode
         self.return_text = return_text
-        print(f"正在加载 {mode} 数据（split_index={split_index}）...")
+        if _is_rank0():
+            print(f"正在加载 {mode} 数据（split_index={split_index}）...")
 
         if _is_bids_root(cfg_data.eeg_path) or _safe_getattr(cfg_data, "backend", "").lower() in {"bids", "ds003825"}:
             self.backend = "ds003825"
@@ -209,19 +216,23 @@ class TripletDataset(Dataset):
                     if sub in keep and 0 <= concept < self.num_available_vectors:
                         self.indices.append(i)
 
-            print(f"ds003825 backend: {mode} 使用 {len(self.indices)} 条 trial（subjects={len(self.ds_subjects)}）")
+            if _is_rank0():
+                print(f"ds003825 backend: {mode} 使用 {len(self.indices)} 条 trial（subjects={len(self.ds_subjects)}）")
             return
 
         # 1. 加载所有数据到内存
         try:
             eeg_loaded_data = torch.load(cfg_data.eeg_path)
             self.all_eeg_items = eeg_loaded_data['dataset']
-            print(f"成功从 {cfg_data.eeg_path} 加载了 'dataset' 列表，包含 {len(self.all_eeg_items)} 个条目。")
+            if _is_rank0():
+                print(f"成功从 {cfg_data.eeg_path} 加载了 'dataset' 列表，包含 {len(self.all_eeg_items)} 个条目。")
         except KeyError:
-            print(f"错误：在 {cfg_data.eeg_path} 中找不到 'dataset' 键。请检查文件结构。")
+            if _is_rank0():
+                print(f"错误：在 {cfg_data.eeg_path} 中找不到 'dataset' 键。请检查文件结构。")
             raise
         except Exception as e:
-            print(f"加载 EEG 数据时出错: {e}")
+            if _is_rank0():
+                print(f"加载 EEG 数据时出错: {e}")
             raise
 
         self.all_image_vectors = torch.from_numpy(np.load(cfg_data.image_vec_path)).float()
@@ -236,9 +247,11 @@ class TripletDataset(Dataset):
         splits_data = torch.load(cfg_data.splits_path)
         try:
             raw_indices = splits_data['splits'][split_index][mode]
-            print(f"使用 split {split_index}，{mode} 模式原始索引数量：{len(raw_indices)}")
+            if _is_rank0():
+                print(f"使用 split {split_index}，{mode} 模式原始索引数量：{len(raw_indices)}")
         except (KeyError, IndexError) as e:
-            print(f"加载 split {split_index} 的 {mode} 划分失败：{e}")
+            if _is_rank0():
+                print(f"加载 split {split_index} 的 {mode} 划分失败：{e}")
             raise
 
         # 3. 过滤索引
@@ -263,9 +276,11 @@ class TripletDataset(Dataset):
                 skipped_count += 1
 
         if skipped_count > 0:
-            warnings.warn(f"在 {mode} 模式下，跳过了 {skipped_count} 个无效条目。")
+            if _is_rank0():
+                warnings.warn(f"在 {mode} 模式下，跳过了 {skipped_count} 个无效条目。")
 
-        print(f"过滤后，{mode} 模式实际使用 {len(self.indices)} 个 EEG 条目。")
+        if _is_rank0():
+            print(f"过滤后，{mode} 模式实际使用 {len(self.indices)} 个 EEG 条目。")
 
     def __len__(self):
         return len(self.indices)

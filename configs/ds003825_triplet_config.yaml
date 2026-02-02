@@ -59,6 +59,7 @@ training:
   distributed:
     enabled: true
     backend: "nccl"
+    find_unused_parameters: true
   patience: 10
   min_delta: 0.01
   weight_decay: 0.1

@@ -219,7 +219,8 @@ def main(cfg: DictConfig):
             config=OmegaConf.to_container(cfg, resolve=True),
         )
 
-    print(f"[rank {rank}/{world_size}] 初始化模型: SpatialMoEEncoder")
+    if is_rank0:
+        print(f"[rank {rank}/{world_size}] 初始化模型: SpatialMoEEncoder")
     model = SpatialMoEEncoder(
         n_channels=cfg.model.n_channels,
         n_samples=cfg.model.n_samples,
@@ -230,7 +231,13 @@ def main(cfg: DictConfig):
     if distributed:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
-        model = DDP(model, device_ids=[device.index], output_device=device.index, find_unused_parameters=False)
+        find_unused = bool(cfg.training.get("distributed", {}).get("find_unused_parameters", True))
+        model = DDP(
+            model,
+            device_ids=[device.index],
+            output_device=device.index,
+            find_unused_parameters=find_unused,
+        )
 
     split_index = int(cfg.data.get("split_index", 0))
     train_dataset = TripletDataset(cfg.data, mode="train", split_index=split_index)
@@ -321,7 +328,8 @@ def main(cfg: DictConfig):
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     best_val = float("inf")
-    print(f"[rank {rank}] 开始训练... (max_steps_per_epoch={max_steps_per_epoch}, grad_accum_steps={grad_accum_steps})")
+    if is_rank0:
+        print(f"[rank {rank}] 开始训练... (max_steps_per_epoch={max_steps_per_epoch}, grad_accum_steps={grad_accum_steps})")
     for epoch in range(int(cfg.training.epochs)):
         if distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -378,4 +386,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

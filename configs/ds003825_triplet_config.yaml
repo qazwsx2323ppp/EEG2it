@@ -18,9 +18,9 @@ data:
   root: ${hydra:runtime.cwd}
   split_index: 0
 
-  # 关键：指向 BIDS 根目录（这里用你的“全量数据”路径）
+  # 关键：指向 BIDS 根目录（可用环境变量覆盖，避免换机器就改 yaml）
   backend: "ds003825"
-  eeg_path: ${data.root}/data/ds003825
+  eeg_path: ${oc.env:DS003825_ROOT,${data.root}/data/ds003825}
 
   # 概念级向量（objectnumber 0..1853），推荐先用 text-only 方案：
   #  - out-text 生成到 data/ds003825_concept_text.npy
@@ -35,7 +35,7 @@ data:
   target_channels: 128
   include_teststim: false
   include_targets: false
-  trial_stride: 1        # 每隔 N 条取 1 条，先做加速/降规模；想用全量就设为 1
+  trial_stride: 10       # 每隔 N 条取 1 条；数据量很大，建议先从 10/20 开始
   drop_exclude_flagged: true
   # subjects: "sub-02,sub-03"   # 可选：只用部分被试
   # exclude_subjects: "sub-01,sub-06,sub-18,sub-23"
@@ -46,6 +46,19 @@ training:
   learning_rate: 0.0001
   num_workers: 4
   device: "cuda"
+  pin_memory: true
+  persistent_workers: true
+
+  # 大数据集训练建议：限制每个 epoch 的迭代步数（想跑全量就设为 0 或删除）
+  max_steps_per_epoch: 2000
+  max_val_steps: 200
+  grad_accum_steps: 1
+  log_every: 50
+  warmup_ratio: 0.1
+
+  distributed:
+    enabled: true
+    backend: "nccl"
   patience: 10
   min_delta: 0.01
   weight_decay: 0.1
@@ -54,7 +67,7 @@ training:
 
 model:
   model_name: 'eeg_moe'
-  pretrained_path: '${data.root}/temp/checkpoint.pth'
+  pretrained_path: ${oc.env:DREAMDIFF_CKPT,${data.root}/temp/checkpoint.pth}
   n_linear_layers: 1
   channel_merge: 'linear'
   n_heads: 8
@@ -76,4 +89,3 @@ model:
 hydra:
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
-

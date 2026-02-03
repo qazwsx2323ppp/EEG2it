@@ -24,7 +24,7 @@ data:
 
   # 概念级向量（objectnumber 0..1853），推荐先用 text-only 方案：
   #  - out-text 生成到 data/ds003825_concept_text.npy
-  #  - out-image 可选生成到 data/ds003825_concept_image.npy (与 text 相同)
+  #  - out-image 生成到 data/ds003825_concept_image.npy（方案一：用不同 prompt 得到“image-like”向量）
   image_vec_path: ${data.root}/data/ds003825_concept_image.npy
   text_vec_path: ${data.root}/data/ds003825_concept_text.npy
 
@@ -63,7 +63,7 @@ training:
   patience: 10
   min_delta: 0.01
   weight_decay: 0.1
-  alpha: 0.0            # 只用 text loss（因为 image_vec 可能等于 text_vec）
+  alpha: 0.5            # 方案一：image_vec/text_vec 来自不同 prompt，可用双头共同训练
   temperature: 0.2
 
 model:

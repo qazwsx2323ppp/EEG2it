@@ -17,6 +17,7 @@ from transformers import get_cosine_schedule_with_warmup
 from dataset import TripletDataset
 from models.clip_models import SpatialMoEEncoder
 from utils.loss_methods import InfoNCE
+from utils.batch_samplers import UniqueConceptBatchSampler
 
 
 def _get_dist_env():
@@ -79,6 +80,8 @@ def train_one_epoch(
     grad_accum_steps: int = 1,
     max_steps: int | None = None,
     log_every: int = 50,
+    sanity_check: bool = False,
+    sanity_check_once: bool = True,
     rank: int = 0,
 ):
     model.train()
@@ -93,6 +96,7 @@ def train_one_epoch(
 
     step = 0
     opt_step = 0
+    did_sanity = False
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", disable=rank != 0)):
         eeg_signals, image_vecs, text_vecs = _to_device(batch, device)
 
@@ -108,6 +112,20 @@ def train_one_epoch(
             loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
 
             loss_to_backprop = loss / max(1, grad_accum_steps)
+
+        if sanity_check and not did_sanity and _is_rank0(rank):
+            # Quick sanity checks for prompt-supervision training:
+            # 1) image/text targets shouldn't be identical (cosine < 1.0)
+            # 2) batch targets should be unique for InfoNCE (unique count ~= batch_size)
+            with torch.no_grad():
+                cos = torch.nn.functional.cosine_similarity(image_vecs, text_vecs, dim=-1).mean().item()
+                uniq_img = torch.unique(image_vecs, dim=0).shape[0]
+                uniq_txt = torch.unique(text_vecs, dim=0).shape[0]
+                bsz = int(image_vecs.shape[0])
+                print(f"[sanity] cos(image_vec, text_vec) mean={cos:.4f} | unique image targets={uniq_img}/{bsz} | unique text targets={uniq_txt}/{bsz}")
+            did_sanity = True
+            if sanity_check_once:
+                sanity_check = False
 
         scaler.scale(loss_to_backprop).backward()
 
@@ -243,7 +261,9 @@ def main(cfg: DictConfig):
     train_dataset = TripletDataset(cfg.data, mode="train", split_index=split_index)
     val_dataset = TripletDataset(cfg.data, mode="val", split_index=split_index)
 
-    if distributed:
+    use_unique_concepts = bool(cfg.data.get("unique_concepts_per_batch", False)) and getattr(train_dataset, "backend", "") == "ds003825"
+
+    if distributed and not use_unique_concepts:
         from torch.utils.data.distributed import DistributedSampler
 
         train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
@@ -257,15 +277,33 @@ def main(cfg: DictConfig):
     pin_memory = bool(cfg.training.get("pin_memory", True))
     persistent_workers = bool(cfg.training.get("persistent_workers", True)) and int(cfg.training.num_workers) > 0
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=shuffle_train,
-        sampler=train_sampler,
-        num_workers=cfg.training.num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
+    if use_unique_concepts:
+        # Use batch_sampler to guarantee unique concept ids per batch (rank-aware under torchrun).
+        train_batch_sampler = UniqueConceptBatchSampler(
+            train_dataset,
+            batch_size=int(cfg.training.batch_size),
+            drop_last=True,
+            shuffle=True,
+            seed=int(cfg.training.get("seed", 0)),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            num_workers=cfg.training.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.training.batch_size,
+            shuffle=shuffle_train,
+            sampler=train_sampler,
+            num_workers=cfg.training.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.training.batch_size,
@@ -347,6 +385,8 @@ def main(cfg: DictConfig):
             grad_accum_steps=grad_accum_steps,
             max_steps=max_steps_per_epoch,
             log_every=int(cfg.training.get("log_every", 50)),
+            sanity_check=bool(cfg.training.get("sanity_check", False)) and epoch == 0,
+            sanity_check_once=True,
             rank=rank,
         )
 
@@ -370,7 +410,15 @@ def main(cfg: DictConfig):
                 }
             )
 
-            print(f"[epoch {epoch}] train={train_loss:.4f} val={val_loss:.4f} (steps={steps})")
+            if bool(cfg.training.get("print_epoch_losses", True)):
+                print(
+                    f"[epoch {epoch}] "
+                    f"train total={train_loss:.4f} img={train_loss_img:.4f} txt={train_loss_txt:.4f} | "
+                    f"val total={val_loss:.4f} img={val_loss_img:.4f} txt={val_loss_txt:.4f} | "
+                    f"steps={steps}"
+                )
+            else:
+                print(f"[epoch {epoch}] train={train_loss:.4f} val={val_loss:.4f} (steps={steps})")
 
             if val_loss < best_val:
                 best_val = val_loss

@@ -31,3 +31,6 @@ python utils/ds003825_embed_concepts.py \
 ## 训练
 
 使用 `main_ds.py` + `configs/ds003825_triplet_config.yaml`。
+
+建议开启“每个 batch 概念唯一”，避免 InfoNCE 在 concept-level 监督下因为 batch 内重复目标而接近随机基线：
+- `data.unique_concepts_per_batch: true`

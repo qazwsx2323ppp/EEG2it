@@ -17,7 +17,7 @@ from transformers import get_cosine_schedule_with_warmup
 from dataset import TripletDataset
 from models.clip_models import SpatialMoEEncoder
 from utils.loss_methods import InfoNCE
-from utils.batch_samplers import UniqueConceptBatchSampler
+from utils.batch_samplers import RepeatBatchSampler, UniqueConceptBatchSampler
 
 
 def _get_dist_env():
@@ -277,15 +277,22 @@ def main(cfg: DictConfig):
     pin_memory = bool(cfg.training.get("pin_memory", True))
     persistent_workers = bool(cfg.training.get("persistent_workers", True)) and int(cfg.training.num_workers) > 0
 
+    train_batch_sampler = None
     if use_unique_concepts:
         # Use batch_sampler to guarantee unique concept ids per batch (rank-aware under torchrun).
-        train_batch_sampler = UniqueConceptBatchSampler(
+        base_sampler = UniqueConceptBatchSampler(
             train_dataset,
             batch_size=int(cfg.training.batch_size),
             drop_last=True,
             shuffle=True,
             seed=int(cfg.training.get("seed", 0)),
         )
+        max_steps_per_epoch = cfg.training.get("max_steps_per_epoch", None)
+        max_steps_per_epoch = int(max_steps_per_epoch) if max_steps_per_epoch not in (None, "", 0) else None
+        if max_steps_per_epoch is not None:
+            train_batch_sampler = RepeatBatchSampler(base_sampler, num_batches=max_steps_per_epoch)
+        else:
+            train_batch_sampler = base_sampler
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
@@ -294,6 +301,8 @@ def main(cfg: DictConfig):
             persistent_workers=persistent_workers,
         )
     else:
+        max_steps_per_epoch = cfg.training.get("max_steps_per_epoch", None)
+        max_steps_per_epoch = int(max_steps_per_epoch) if max_steps_per_epoch not in (None, "", 0) else None
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.training.batch_size,
@@ -354,9 +363,6 @@ def main(cfg: DictConfig):
         )
 
     # Scheduler steps are based on actual optimizer steps
-    max_steps_per_epoch = cfg.training.get("max_steps_per_epoch", None)
-    max_steps_per_epoch = int(max_steps_per_epoch) if max_steps_per_epoch not in (None, "", 0) else None
-
     grad_accum_steps = int(cfg.training.get("grad_accum_steps", 1) or 1)
     effective_batches = len(train_loader) if max_steps_per_epoch is None else min(len(train_loader), max_steps_per_epoch)
     total_opt_steps = max(1, (effective_batches // max(1, grad_accum_steps)) * int(cfg.training.epochs))
@@ -366,9 +372,19 @@ def main(cfg: DictConfig):
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     best_val = float("inf")
+    early_stop_enabled = bool(cfg.training.get("early_stopping", True))
+    patience = int(cfg.training.get("patience", 10))
+    min_delta = float(cfg.training.get("min_delta", 0.0))
+    epochs_no_improve = 0
     if is_rank0:
         print(f"[rank {rank}] 开始训练... (max_steps_per_epoch={max_steps_per_epoch}, grad_accum_steps={grad_accum_steps})")
     for epoch in range(int(cfg.training.epochs)):
+        # Reseed unique-concept sampler each epoch (rank-aware)
+        if use_unique_concepts and train_batch_sampler is not None:
+            base = getattr(train_batch_sampler, "batch_sampler", None) or train_batch_sampler
+            if hasattr(base, "set_epoch"):
+                base.set_epoch(epoch)
+
         if distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -394,6 +410,7 @@ def main(cfg: DictConfig):
             model, val_loader, loss_fn_img, loss_fn_txt, device, float(cfg.training.alpha), max_steps=int(cfg.training.get("max_val_steps", 200)), rank=rank
         )
 
+        stop_now = False
         if is_rank0:
             wandb.log(
                 {
@@ -420,12 +437,33 @@ def main(cfg: DictConfig):
             else:
                 print(f"[epoch {epoch}] train={train_loss:.4f} val={val_loss:.4f} (steps={steps})")
 
+            prev_best = best_val
             if val_loss < best_val:
                 best_val = val_loss
                 out_path = os.path.join(wandb.run.dir, "best_eeg_encoder_ds003825.pth")
                 state = model.module.state_dict() if distributed else model.state_dict()
                 torch.save(state, out_path)
                 print(f"保存 best checkpoint: {out_path}")
+
+            if early_stop_enabled:
+                improvement = prev_best - val_loss
+                if improvement > min_delta:
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"EarlyStopping: val_loss 未改善达到 {patience} 个 epoch（min_delta={min_delta}），停止训练。")
+                    stop_now = True
+
+        if distributed:
+            import torch.distributed as dist
+
+            flag = torch.tensor([1 if stop_now else 0], device=device)
+            dist.broadcast(flag, src=0)
+            stop_now = bool(flag.item())
+
+        if stop_now:
+            break
 
     if is_rank0:
         wandb.finish()

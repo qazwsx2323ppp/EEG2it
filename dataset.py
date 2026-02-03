@@ -27,6 +27,13 @@ def _safe_getattr(obj, name, default=None):
     except Exception:
         return default
 
+
+def _zscore_channelwise(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # x: [C, T]
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True)
+    return (x - mean) / (std + eps)
+
 def _ds003825_build_or_get_index(
     bids_root: str,
     include_teststim: bool,
@@ -168,6 +175,8 @@ class TripletDataset(Dataset):
             include_targets = bool(_safe_getattr(cfg_data, "include_targets", False))
             trial_stride = int(_safe_getattr(cfg_data, "trial_stride", 1) or 1)
             target_channels = int(_safe_getattr(cfg_data, "target_channels", 128) or 128)
+            zscore = bool(_safe_getattr(cfg_data, "zscore", False))
+            zscore_eps = float(_safe_getattr(cfg_data, "zscore_eps", 1e-6))
 
             allowed_subjects = _safe_getattr(cfg_data, "subjects", None)
             if isinstance(allowed_subjects, str):
@@ -198,6 +207,8 @@ class TripletDataset(Dataset):
             self.ds_concept_ids = index["concept_ids"]
             self.target_channels = target_channels
             self.bids_root = bids_root
+            self.zscore = zscore
+            self.zscore_eps = zscore_eps
 
             self.all_image_vectors = torch.from_numpy(np.load(cfg_data.image_vec_path)).float()
             self.all_text_vectors = torch.from_numpy(np.load(cfg_data.text_vec_path)).float()
@@ -348,6 +359,9 @@ class TripletDataset(Dataset):
                 eeg_signal = eeg_signal[: self.target_channels, :]
 
             eeg_signal = torch.from_numpy(eeg_signal).float()
+
+            if getattr(self, "zscore", False):
+                eeg_signal = _zscore_channelwise(eeg_signal, eps=float(getattr(self, "zscore_eps", 1e-6)))
 
             if self.mode == "train":
                 noise = torch.randn_like(eeg_signal) * 0.02

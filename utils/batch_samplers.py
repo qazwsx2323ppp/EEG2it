@@ -1,6 +1,7 @@
 import os
 import random
 from collections import defaultdict
+from itertools import cycle
 from typing import Iterator, List, Sequence
 
 import torch
@@ -45,6 +46,7 @@ class UniqueConceptBatchSampler(torch.utils.data.Sampler[List[int]]):
         self.drop_last = bool(drop_last)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
+        self.epoch = 0
 
         # Expect ds003825 backend fields.
         if not hasattr(dataset, "backend") or getattr(dataset, "backend") != "ds003825":
@@ -61,13 +63,16 @@ class UniqueConceptBatchSampler(torch.utils.data.Sampler[List[int]]):
         self._concept_to_items = dict(concept_to_items)
         self._concepts: List[int] = sorted(self._concept_to_items.keys())
 
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
     def __iter__(self) -> Iterator[List[int]]:
         world_size, rank = _get_dist_env()
 
         # Rank-aware shuffle of concept list.
         concepts = list(self._concepts)
         if self.shuffle:
-            rng = random.Random(self.seed + rank)
+            rng = random.Random(self.seed + (self.epoch * 10_000) + rank)
             rng.shuffle(concepts)
 
         # Partition concepts across ranks deterministically.
@@ -75,7 +80,7 @@ class UniqueConceptBatchSampler(torch.utils.data.Sampler[List[int]]):
             concepts = concepts[rank::world_size]
 
         # Sample one trial per concept to build batches.
-        rng_pick = random.Random(self.seed + 10_000 + rank)
+        rng_pick = random.Random(self.seed + (self.epoch * 10_000) + 10_000 + rank)
         batch: List[int] = []
         for concept in concepts:
             items = self._concept_to_items[concept]
@@ -97,3 +102,24 @@ class UniqueConceptBatchSampler(torch.utils.data.Sampler[List[int]]):
             return n // self.batch_size
         return (n + self.batch_size - 1) // self.batch_size
 
+
+class RepeatBatchSampler(torch.utils.data.Sampler[List[int]]):
+    """
+    Wrap a batch sampler and repeat it to yield exactly `num_batches` batches.
+    Useful when the underlying sampler has a natural epoch length (e.g. unique concepts)
+    but you want a fixed number of optimizer steps per epoch.
+    """
+
+    def __init__(self, batch_sampler: torch.utils.data.Sampler[List[int]], num_batches: int):
+        self.batch_sampler = batch_sampler
+        self.num_batches = int(num_batches)
+        if self.num_batches <= 0:
+            raise ValueError("num_batches must be > 0")
+
+    def __iter__(self) -> Iterator[List[int]]:
+        it = cycle(iter(self.batch_sampler))
+        for _ in range(self.num_batches):
+            yield next(it)
+
+    def __len__(self) -> int:
+        return self.num_batches

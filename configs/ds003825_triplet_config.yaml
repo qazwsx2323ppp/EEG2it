@@ -38,6 +38,8 @@ data:
   trial_stride: 10       # 每隔 N 条取 1 条；数据量很大，建议先从 10/20 开始
   drop_exclude_flagged: true
   unique_concepts_per_batch: true
+  zscore: true
+  zscore_eps: 1e-6
   # subjects: "sub-02,sub-03"   # 可选：只用部分被试
   # exclude_subjects: "sub-01,sub-06,sub-18,sub-23"
 
@@ -51,6 +53,7 @@ training:
   persistent_workers: true
   print_epoch_losses: true
   sanity_check: true
+  early_stopping: true
 
   # 大数据集训练建议：限制每个 epoch 的迭代步数（想跑全量就设为 0 或删除）
   max_steps_per_epoch: 2000

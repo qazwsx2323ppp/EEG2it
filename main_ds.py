@@ -4,11 +4,12 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import os
+import json
+from datetime import datetime
 
 import hydra
 import torch
 import torch.optim as optim
-import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -62,9 +63,51 @@ def _is_rank0(rank: int) -> bool:
     return rank == 0
 
 
+def _maybe_init_wandb(cfg: DictConfig, enabled: bool, is_rank0: bool):
+    if not (enabled and is_rank0):
+        return None
+    try:
+        import wandb  # type: ignore
+
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.wandb.name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        return wandb
+    except Exception as e:
+        print(f"[warn] wandb init failed, continuing without wandb: {e}")
+        return None
+
+
+def _write_json(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _append_jsonl(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
 def _to_device(batch, device):
-    eeg_signals, image_vecs, text_vecs = batch
-    return eeg_signals.to(device, non_blocking=True), image_vecs.to(device, non_blocking=True), text_vecs.to(device, non_blocking=True)
+    if len(batch) == 3:
+        eeg_signals, image_vecs, text_vecs = batch
+        concept_ids = None
+    elif len(batch) == 4:
+        eeg_signals, image_vecs, text_vecs, concept_ids = batch
+    else:
+        raise ValueError(f"Unexpected batch size: {len(batch)}")
+
+    eeg_signals = eeg_signals.to(device, non_blocking=True)
+    image_vecs = image_vecs.to(device, non_blocking=True)
+    text_vecs = text_vecs.to(device, non_blocking=True)
+    if concept_ids is not None:
+        concept_ids = torch.as_tensor(concept_ids, device=device)
+    return eeg_signals, image_vecs, text_vecs, concept_ids
 
 
 def train_one_epoch(
@@ -98,7 +141,7 @@ def train_one_epoch(
     opt_step = 0
     did_sanity = False
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", disable=rank != 0)):
-        eeg_signals, image_vecs, text_vecs = _to_device(batch, device)
+        eeg_signals, image_vecs, text_vecs, _ = _to_device(batch, device)
 
         with autocast_ctx:
             outputs = model(eeg_signals)
@@ -143,15 +186,7 @@ def train_one_epoch(
         total_loss_txt += float(loss_txt.detach().cpu())
 
         step += 1
-        if _is_rank0(rank) and log_every and step % log_every == 0:
-            wandb.log(
-                {
-                    "train/step_loss_total": total_loss / step,
-                    "train/step_loss_image": total_loss_img / step,
-                    "train/step_loss_text": total_loss_txt / step,
-                    "train/optimizer_steps": opt_step,
-                }
-            )
+        # metrics logging handled at epoch-level (and optional wandb in main)
 
         if max_steps is not None and step >= max_steps:
             break
@@ -169,7 +204,7 @@ def validate_loss_only(model, dataloader, loss_fn_img, loss_fn_txt, device, alph
     steps = 0
 
     for batch in tqdm(dataloader, desc="Validation", disable=rank != 0):
-        eeg_signals, image_vecs, text_vecs = _to_device(batch, device)
+        eeg_signals, image_vecs, text_vecs, _ = _to_device(batch, device)
         outputs = model(eeg_signals)
         if len(outputs) == 3:
             eeg_img_embeddings, eeg_text_embeddings, _ = outputs
@@ -189,6 +224,133 @@ def validate_loss_only(model, dataloader, loss_fn_img, loss_fn_txt, device, alph
 
     denom = max(1, steps)
     return (total_loss / denom), (total_loss_img / denom), (total_loss_txt / denom), steps
+
+
+def compute_retrieval_metrics(similarity_matrix: torch.Tensor, k_values=(1, 5, 10)) -> dict:
+    # similarity_matrix: [N, N] with correct pair on diagonal
+    _, sorted_indices = torch.sort(similarity_matrix, dim=1, descending=True)
+    correct_labels = torch.arange(similarity_matrix.shape[0], device=similarity_matrix.device)
+    metrics = {}
+    for k in k_values:
+        top_k_indices = sorted_indices[:, :k]
+        hits = (top_k_indices == correct_labels.unsqueeze(1)).any(dim=1)
+        metrics[f"top_{k}_accuracy"] = hits.float().mean().item()
+
+    positive_sim = torch.diag(similarity_matrix).mean().item()
+    mask = ~torch.eye(similarity_matrix.shape[0], dtype=torch.bool, device=similarity_matrix.device)
+    negative_sim = similarity_matrix[mask].mean().item()
+    metrics["mean_positive_similarity"] = positive_sim
+    metrics["mean_negative_similarity"] = negative_sim
+    metrics["separation_ratio"] = positive_sim / (negative_sim + 1e-8)
+    return metrics
+
+
+@torch.no_grad()
+def evaluate_concept_retrieval(
+    model,
+    dataloader,
+    loss_fn_img,
+    loss_fn_txt,
+    device,
+    alpha: float,
+    max_steps: int | None,
+    num_concepts: int,
+    embedding_dim: int,
+    distributed: bool,
+    rank: int,
+    k_values=(1, 5, 10),
+):
+    """
+    Evaluate by averaging EEG embeddings per concept id and computing retrieval against concept targets.
+    This is more meaningful than InfoNCE loss when the dataset has repeated concepts.
+    """
+    model.eval()
+    sums_img = torch.zeros((num_concepts, embedding_dim), device=device, dtype=torch.float32)
+    sums_txt = torch.zeros((num_concepts, embedding_dim), device=device, dtype=torch.float32)
+    counts = torch.zeros((num_concepts,), device=device, dtype=torch.float32)
+
+    total_loss = torch.tensor(0.0, device=device)
+    total_loss_img = torch.tensor(0.0, device=device)
+    total_loss_txt = torch.tensor(0.0, device=device)
+    steps = 0
+
+    for batch in tqdm(dataloader, desc="Validation", disable=rank != 0):
+        eeg_signals, image_vecs, text_vecs, concept_ids = _to_device(batch, device)
+        if concept_ids is None:
+            raise RuntimeError("Concept retrieval eval requires data.return_concept_id=true")
+
+        outputs = model(eeg_signals)
+        if len(outputs) == 3:
+            eeg_img_emb, eeg_txt_emb, _ = outputs
+        else:
+            eeg_img_emb, eeg_txt_emb = outputs
+
+        loss_img = loss_fn_img(eeg_img_emb, image_vecs)
+        loss_txt = loss_fn_txt(eeg_txt_emb, text_vecs)
+        loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
+
+        total_loss += loss.detach()
+        total_loss_img += loss_img.detach()
+        total_loss_txt += loss_txt.detach()
+
+        concept_ids = concept_ids.long()
+        sums_img.index_add_(0, concept_ids, eeg_img_emb.float())
+        sums_txt.index_add_(0, concept_ids, eeg_txt_emb.float())
+        counts.index_add_(0, concept_ids, torch.ones_like(concept_ids, dtype=torch.float32))
+
+        steps += 1
+        if max_steps is not None and steps >= max_steps:
+            break
+
+    if distributed:
+        import torch.distributed as dist
+
+        dist.all_reduce(sums_img, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sums_txt, op=dist.ReduceOp.SUM)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss_img, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss_txt, op=dist.ReduceOp.SUM)
+        steps_t = torch.tensor(float(steps), device=device)
+        dist.all_reduce(steps_t, op=dist.ReduceOp.SUM)
+        steps = int(steps_t.item())
+
+    denom_steps = max(1, steps)
+    avg_loss = (total_loss / denom_steps).item()
+    avg_loss_img = (total_loss_img / denom_steps).item()
+    avg_loss_txt = (total_loss_txt / denom_steps).item()
+
+    # Concept means and normalization
+    counts_clamped = counts.clamp_min(1.0).unsqueeze(1)
+    eeg_img_mean = sums_img / counts_clamped
+    eeg_txt_mean = sums_txt / counts_clamped
+    eeg_img_mean = eeg_img_mean / (eeg_img_mean.norm(dim=-1, keepdim=True) + 1e-12)
+    eeg_txt_mean = eeg_txt_mean / (eeg_txt_mean.norm(dim=-1, keepdim=True) + 1e-12)
+
+    # Use the dataset's concept targets
+    ds = dataloader.dataset
+    target_img = ds.all_image_vectors.to(device)
+    target_txt = ds.all_text_vectors.to(device)
+    target_img = target_img / (target_img.norm(dim=-1, keepdim=True) + 1e-12)
+    target_txt = target_txt / (target_txt.norm(dim=-1, keepdim=True) + 1e-12)
+
+    sim_img = eeg_img_mean @ target_img.T
+    sim_txt = eeg_txt_mean @ target_txt.T
+
+    img_metrics = compute_retrieval_metrics(sim_img, k_values=k_values)
+    txt_metrics = compute_retrieval_metrics(sim_txt, k_values=k_values)
+
+    # Also report how many concepts are actually present in eval
+    present = int((counts > 0).sum().item())
+    return {
+        "loss": avg_loss,
+        "loss_img": avg_loss_img,
+        "loss_txt": avg_loss_txt,
+        "img_metrics": img_metrics,
+        "txt_metrics": txt_metrics,
+        "present_concepts": present,
+        "steps": steps,
+    }
 
 
 def check_parameter_updates(model):
@@ -228,14 +390,17 @@ def main(cfg: DictConfig):
         device = torch.device(cfg.training.device)
 
     is_rank0 = _is_rank0(rank)
+    run_dir = os.getcwd()  # Hydra sets CWD to the run directory by default.
+    metrics_jsonl = os.path.join(run_dir, "metrics_epoch.jsonl")
+    metrics_summary_path = os.path.join(run_dir, "metrics_summary.json")
+    metrics_txt_path = os.path.join(run_dir, "metrics_summary.txt")
+
     if is_rank0:
         print("Hydra 配置:\n", OmegaConf.to_yaml(cfg))
-        wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
-            name=cfg.wandb.name,
-            config=OmegaConf.to_container(cfg, resolve=True),
-        )
+        print(f"[rank0] run_dir: {run_dir}")
+
+    use_wandb = bool(cfg.training.get("use_wandb", False))
+    wandb = _maybe_init_wandb(cfg, enabled=use_wandb, is_rank0=is_rank0)
 
     if is_rank0:
         print(f"[rank {rank}/{world_size}] 初始化模型: SpatialMoEEncoder")
@@ -263,16 +428,19 @@ def main(cfg: DictConfig):
 
     use_unique_concepts = bool(cfg.data.get("unique_concepts_per_batch", False)) and getattr(train_dataset, "backend", "") == "ds003825"
 
-    if distributed and not use_unique_concepts:
+    train_sampler = None
+    val_sampler = None
+    shuffle_train = True
+
+    if distributed:
         from torch.utils.data.distributed import DistributedSampler
 
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-        shuffle_train = False
-    else:
-        train_sampler = None
-        val_sampler = None
-        shuffle_train = True
+        if not use_unique_concepts:
+            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+            shuffle_train = False
+
+        if bool(cfg.training.get("distributed", {}).get("val_sampler", True)):
+            val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
 
     pin_memory = bool(cfg.training.get("pin_memory", True))
     persistent_workers = bool(cfg.training.get("persistent_workers", True)) and int(cfg.training.num_workers) > 0
@@ -313,6 +481,7 @@ def main(cfg: DictConfig):
             persistent_workers=persistent_workers,
         )
 
+    # For meaningful retrieval evaluation under repeated concepts, val_loader should include concept ids.
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.training.batch_size,
@@ -354,13 +523,14 @@ def main(cfg: DictConfig):
 
     if is_rank0:
         param_info = check_parameter_updates(model if not distributed else model.module)
-        wandb.log(
-            {
-                "trainable_params": param_info["trainable_count"],
-                "frozen_params": param_info["frozen_count"],
-                "trainable_ratio": param_info["trainable_ratio"],
-            }
-        )
+        if wandb is not None:
+            wandb.log(
+                {
+                    "trainable_params": param_info["trainable_count"],
+                    "frozen_params": param_info["frozen_count"],
+                    "trainable_ratio": param_info["trainable_ratio"],
+                }
+            )
 
     # Scheduler steps are based on actual optimizer steps
     grad_accum_steps = int(cfg.training.get("grad_accum_steps", 1) or 1)
@@ -372,6 +542,7 @@ def main(cfg: DictConfig):
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     best_val = float("inf")
+    best_epoch = -1
     early_stop_enabled = bool(cfg.training.get("early_stopping", True))
     patience = int(cfg.training.get("patience", 10))
     min_delta = float(cfg.training.get("min_delta", 0.0))
@@ -406,32 +577,80 @@ def main(cfg: DictConfig):
             rank=rank,
         )
 
-        val_loss, val_loss_img, val_loss_txt, val_steps = validate_loss_only(
-            model, val_loader, loss_fn_img, loss_fn_txt, device, float(cfg.training.alpha), max_steps=int(cfg.training.get("max_val_steps", 200)), rank=rank
+        val_max_steps = int(cfg.training.get("max_val_steps", 200))
+        val_results = evaluate_concept_retrieval(
+            model=model,
+            dataloader=val_loader,
+            loss_fn_img=loss_fn_img,
+            loss_fn_txt=loss_fn_txt,
+            device=device,
+            alpha=float(cfg.training.alpha),
+            max_steps=val_max_steps if val_max_steps not in (0, None) else None,
+            num_concepts=int(cfg.data.get("num_concepts", 1854)),
+            embedding_dim=int(cfg.model.embedding_dim),
+            distributed=distributed,
+            rank=rank,
+            k_values=tuple(int(k) for k in cfg.training.get("k_values", [1, 5, 10])),
         )
+        val_loss = float(val_results["loss"])
+        val_loss_img = float(val_results["loss_img"])
+        val_loss_txt = float(val_results["loss_txt"])
+        val_steps = int(val_results.get("steps", 0))
 
         stop_now = False
         if is_rank0:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "train/loss_total": train_loss,
-                    "train/loss_image": train_loss_img,
-                    "train/loss_text": train_loss_txt,
-                    "train/steps": steps,
-                    "val/loss_total": val_loss,
-                    "val/loss_image": val_loss_img,
-                    "val/loss_text": val_loss_txt,
-                    "val/steps": val_steps,
-                    "lr": optimizer.param_groups[0]["lr"],
-                }
-            )
+            epoch_metrics = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "epoch": epoch,
+                "train": {
+                    "loss_total": train_loss,
+                    "loss_image": train_loss_img,
+                    "loss_text": train_loss_txt,
+                    "steps": steps,
+                },
+                "val": {
+                    "loss_total": val_loss,
+                    "loss_image": val_loss_img,
+                    "loss_text": val_loss_txt,
+                    "steps": val_steps,
+                    "present_concepts": int(val_results.get("present_concepts", 0)),
+                    "img_metrics": val_results["img_metrics"],
+                    "txt_metrics": val_results["txt_metrics"],
+                },
+                "lr": float(optimizer.param_groups[0]["lr"]),
+            }
+            _append_jsonl(metrics_jsonl, epoch_metrics)
+
+            if wandb is not None:
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train/loss_total": train_loss,
+                        "train/loss_image": train_loss_img,
+                        "train/loss_text": train_loss_txt,
+                        "train/steps": steps,
+                        "val/loss_total": val_loss,
+                        "val/loss_image": val_loss_img,
+                        "val/loss_text": val_loss_txt,
+                        "val/steps": val_steps,
+                        "val/present_concepts": val_results.get("present_concepts", 0),
+                        "val/img_top1": val_results["img_metrics"]["top_1_accuracy"],
+                        "val/img_top5": val_results["img_metrics"]["top_5_accuracy"],
+                        "val/img_top10": val_results["img_metrics"]["top_10_accuracy"],
+                        "val/txt_top1": val_results["txt_metrics"]["top_1_accuracy"],
+                        "val/txt_top5": val_results["txt_metrics"]["top_5_accuracy"],
+                        "val/txt_top10": val_results["txt_metrics"]["top_10_accuracy"],
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                )
 
             if bool(cfg.training.get("print_epoch_losses", True)):
                 print(
                     f"[epoch {epoch}] "
                     f"train total={train_loss:.4f} img={train_loss_img:.4f} txt={train_loss_txt:.4f} | "
                     f"val total={val_loss:.4f} img={val_loss_img:.4f} txt={val_loss_txt:.4f} | "
+                    f"val img@1={val_results['img_metrics']['top_1_accuracy']*100:.2f}% "
+                    f"txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% | "
                     f"steps={steps}"
                 )
             else:
@@ -440,7 +659,8 @@ def main(cfg: DictConfig):
             prev_best = best_val
             if val_loss < best_val:
                 best_val = val_loss
-                out_path = os.path.join(wandb.run.dir, "best_eeg_encoder_ds003825.pth")
+                best_epoch = epoch
+                out_path = os.path.join(run_dir, "best_eeg_encoder_ds003825.pth")
                 state = model.module.state_dict() if distributed else model.state_dict()
                 torch.save(state, out_path)
                 print(f"保存 best checkpoint: {out_path}")
@@ -466,7 +686,20 @@ def main(cfg: DictConfig):
             break
 
     if is_rank0:
-        wandb.finish()
+        summary = {
+            "best_val_loss": best_val,
+            "best_epoch": best_epoch,
+            "run_dir": run_dir,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+        _write_json(metrics_summary_path, summary)
+        with open(metrics_txt_path, "w", encoding="utf-8") as f:
+            f.write(f"best_epoch: {best_epoch}\n")
+            f.write(f"best_val_loss: {best_val}\n")
+            f.write(f"metrics_epoch_jsonl: {metrics_jsonl}\n")
+            f.write(f"best_checkpoint: {os.path.join(run_dir, 'best_eeg_encoder_ds003825.pth')}\n")
+        if wandb is not None:
+            wandb.finish()
     _dist_cleanup()
 
 

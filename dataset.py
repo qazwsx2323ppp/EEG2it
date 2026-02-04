@@ -177,6 +177,7 @@ class TripletDataset(Dataset):
             target_channels = int(_safe_getattr(cfg_data, "target_channels", 128) or 128)
             zscore = bool(_safe_getattr(cfg_data, "zscore", False))
             zscore_eps = float(_safe_getattr(cfg_data, "zscore_eps", 1e-6))
+            return_concept_id = bool(_safe_getattr(cfg_data, "return_concept_id", False))
 
             allowed_subjects = _safe_getattr(cfg_data, "subjects", None)
             if isinstance(allowed_subjects, str):
@@ -209,6 +210,7 @@ class TripletDataset(Dataset):
             self.bids_root = bids_root
             self.zscore = zscore
             self.zscore_eps = zscore_eps
+            self.return_concept_id = return_concept_id
 
             self.all_image_vectors = torch.from_numpy(np.load(cfg_data.image_vec_path)).float()
             self.all_text_vectors = torch.from_numpy(np.load(cfg_data.text_vec_path)).float()
@@ -372,6 +374,8 @@ class TripletDataset(Dataset):
 
             image_vector = self.all_image_vectors[concept]
             text_vector = self.all_text_vectors[concept]
+            if getattr(self, "return_concept_id", False):
+                return eeg_signal, image_vector, text_vector, concept
             return eeg_signal, image_vector, text_vector
 
         # 1. 获取原始 EEG 数据

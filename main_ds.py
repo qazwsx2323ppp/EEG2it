@@ -516,7 +516,6 @@ def main(cfg: DictConfig):
     distributed = _dist_enabled(cfg)
     rank = 0
     world_size = 1
-
     if distributed:
         device, rank, world_size = _dist_setup(cfg)
     else:
@@ -840,25 +839,25 @@ def main(cfg: DictConfig):
         if stop_now:
             break
 
-    if is_rank0:
-        summary = {
-            "best_val_loss": best_val_loss,
-            "best_epoch": best_epoch,
-            "best_score": best_score,
-            "selection_metric": selection_metric,
-            "selection_mode": selection_mode,
-            "run_dir": run_dir,
-            "config": OmegaConf.to_container(cfg, resolve=True),
-        }
-        _write_json(metrics_summary_path, summary)
-        with open(metrics_txt_path, "w", encoding="utf-8") as f:
-            f.write(f"best_epoch: {best_epoch}\n")
-            f.write(f"best_val_loss: {best_val_loss}\n")
-            f.write(f"best_score ({selection_metric}): {best_score}\n")
-            f.write(f"metrics_epoch_jsonl: {metrics_jsonl}\n")
-            f.write(f"best_checkpoint: {os.path.join(run_dir, 'best_eeg_encoder_ds003825.pth')}\n")
-        if wandb is not None:
-            wandb.finish()
+        if is_rank0:
+            summary = {
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+                "selection_metric": selection_metric,
+                "selection_mode": selection_mode,
+                "run_dir": run_dir,
+                "config": OmegaConf.to_container(cfg, resolve=True),
+            }
+            _write_json(metrics_summary_path, summary)
+            with open(metrics_txt_path, "w", encoding="utf-8") as f:
+                f.write(f"best_epoch: {best_epoch}\n")
+                f.write(f"best_val_loss: {best_val_loss}\n")
+                f.write(f"best_score ({selection_metric}): {best_score}\n")
+                f.write(f"metrics_epoch_jsonl: {metrics_jsonl}\n")
+                f.write(f"best_checkpoint: {os.path.join(run_dir, 'best_eeg_encoder_ds003825.pth')}\n")
+            if wandb is not None:
+                wandb.finish()
     _dist_cleanup()
 
 
@@ -875,3 +874,11 @@ if __name__ == "__main__":
         except Exception:
             pass
         os._exit(130)
+    except BaseException:
+        # Ensure we don't leave NCCL process groups behind on errors.
+        _dist_abort_best_effort()
+        try:
+            _dist_cleanup()
+        except Exception:
+            pass
+        raise

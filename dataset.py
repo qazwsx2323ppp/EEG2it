@@ -94,21 +94,91 @@ def _ds003825_build_or_get_index(
     subject_ids: list[int] = []
     samples: list[int] = []
     concept_ids: list[int] = []
+    vhdr_paths: list[str] = [""] * len(subjects)
+
+    # Stats for debugging "no usable trials" errors.
+    stats = {
+        "subjects_total": len(subjects),
+        "subjects_with_files": 0,
+        "subjects_raw_ok": 0,
+        "subjects_events_ok": 0,
+        "raw_errors": 0,
+        "events_errors": 0,
+        "trials_before_filter": 0,
+        "trials_after_filter": 0,
+        "small_eeg_files": 0,
+    }
 
     for sub in subjects:
         eeg_dir = os.path.join(bids_root, sub, "eeg")
-        events_path = os.path.join(eeg_dir, f"{sub}_task-rsvp_events.tsv")
-        vhdr_path = os.path.join(eeg_dir, f"{sub}_task-rsvp_eeg.vhdr")
-        if not (os.path.isfile(events_path) and os.path.isfile(vhdr_path)):
+        if not os.path.isdir(eeg_dir):
             continue
 
-        # Use raw length to drop out-of-range epochs early.
-        raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose="ERROR")
-        n_times = int(raw.n_times)
-        sfreq = float(getattr(raw.info, "sfreq", raw.info.get("sfreq", 1000.0)))
-        raw.close()
+        import glob
 
-        dfe = pd.read_csv(events_path, sep="\t")
+        # Be tolerant to task naming differences by globbing.
+        events_candidates = []
+        events_candidates += glob.glob(os.path.join(eeg_dir, f"{sub}_task-*_events.tsv"))
+        events_candidates += glob.glob(os.path.join(eeg_dir, f"{sub}_task-*_events.csv"))
+        events_candidates += glob.glob(os.path.join(eeg_dir, f"{sub}_*_events.tsv"))
+        events_candidates += glob.glob(os.path.join(eeg_dir, f"{sub}_*_events.csv"))
+        events_candidates = sorted(set(events_candidates))
+
+        vhdr_candidates = []
+        vhdr_candidates += glob.glob(os.path.join(eeg_dir, f"{sub}_task-*_eeg.vhdr"))
+        vhdr_candidates += glob.glob(os.path.join(eeg_dir, f"{sub}_*_eeg.vhdr"))
+        vhdr_candidates += glob.glob(os.path.join(eeg_dir, "*.vhdr"))
+        vhdr_candidates = sorted(set(vhdr_candidates))
+
+        if not events_candidates or not vhdr_candidates:
+            continue
+
+        # Prefer RSVP task if present.
+        def _prefer_rsvp(paths: list[str]) -> str:
+            for p in paths:
+                if "task-rsvp" in os.path.basename(p):
+                    return p
+            return paths[0]
+
+        events_path = _prefer_rsvp(events_candidates)
+        vhdr_path = _prefer_rsvp(vhdr_candidates)
+
+        stats["subjects_with_files"] += 1
+
+        # Quick pointer-file heuristic: a real BrainVision .eeg is typically large.
+        eeg_bin = ""
+        for cand in glob.glob(os.path.join(eeg_dir, "*.eeg")) + glob.glob(os.path.join(eeg_dir, "*.EEG")):
+            eeg_bin = cand
+            break
+        try:
+            if os.path.isfile(eeg_bin) and os.path.getsize(eeg_bin) < 1_000_000:
+                # A real BrainVision .eeg is typically tens/hundreds of MB; tiny files often indicate git-annex pointers.
+                stats["small_eeg_files"] += 1
+        except Exception:
+            pass
+
+        # Use raw length to drop out-of-range epochs early.
+        try:
+            raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose="ERROR")
+            n_times = int(raw.n_times)
+            sfreq = float(getattr(raw.info, "sfreq", raw.info.get("sfreq", 1000.0)))
+            raw.close()
+            stats["subjects_raw_ok"] += 1
+            # Record the chosen vhdr path for this subject id (used later in __getitem__).
+            vhdr_paths[subject_to_id[sub]] = vhdr_path
+        except Exception:
+            stats["raw_errors"] += 1
+            continue
+
+        try:
+            if events_path.lower().endswith(".csv"):
+                dfe = pd.read_csv(events_path)
+            else:
+                dfe = pd.read_csv(events_path, sep="\t")
+            stats["subjects_events_ok"] += 1
+        except Exception:
+            stats["events_errors"] += 1
+            continue
 
         if "objectnumber" not in dfe.columns or "onset" not in dfe.columns:
             continue
@@ -125,6 +195,8 @@ def _ds003825_build_or_get_index(
         # Optional subsample to keep it manageable
         if trial_stride and trial_stride > 1:
             dfe = dfe.iloc[::trial_stride, :]
+
+        stats["trials_before_filter"] += int(len(dfe))
 
         # Convert event timing to sample indices.
         # NOTE: ds003825 events.tsv stores 'onset' in seconds (float), and also provides a 'sample' column.
@@ -144,19 +216,35 @@ def _ds003825_build_or_get_index(
         if len(dfe) == 0:
             continue
 
+        stats["trials_after_filter"] += int(len(dfe))
+
         sid = subject_to_id[sub]
         subject_ids.extend([sid] * len(dfe))
         samples.extend(sample_arr.tolist())
         concept_ids.extend(dfe["objectnumber"].astype(int).tolist())
 
     if not subject_ids:
-        raise ValueError(f"No usable trials found under bids_root={bids_root}")
+        raise ValueError(
+            "No usable trials found under bids_root="
+            f"{bids_root} "
+            f"(subjects_total={stats['subjects_total']}, "
+            f"subjects_with_files={stats['subjects_with_files']}, "
+            f"subjects_raw_ok={stats['subjects_raw_ok']}, "
+            f"subjects_events_ok={stats['subjects_events_ok']}, "
+            f"raw_errors={stats['raw_errors']}, "
+            f"events_errors={stats['events_errors']}, "
+            f"trials_before_filter={stats['trials_before_filter']}, "
+            f"trials_after_filter={stats['trials_after_filter']}, "
+            f"small_eeg_files={stats['small_eeg_files']}). "
+            "Check DS003825_ROOT points to the BIDS root with real BrainVision .eeg data (not git-annex pointer files)."
+        )
 
     index = {
         "subjects": subjects,
         "subject_ids": torch.tensor(subject_ids, dtype=torch.uint8),
         "samples": torch.tensor(samples, dtype=torch.int32),
         "concept_ids": torch.tensor(concept_ids, dtype=torch.int16),
+        "vhdr_paths": vhdr_paths,
     }
     _DS003825_INDEX_CACHE[key] = index
     return index
@@ -216,6 +304,7 @@ class TripletDataset(Dataset):
             self.ds_subject_ids = index["subject_ids"]
             self.ds_samples = index["samples"]
             self.ds_concept_ids = index["concept_ids"]
+            self.ds_vhdr_paths = index.get("vhdr_paths", [""] * len(self.ds_subjects))
             self.target_channels = target_channels
             self.bids_root = bids_root
             self.zscore = zscore
@@ -352,7 +441,15 @@ class TripletDataset(Dataset):
             # Load/cached BrainVision raw per-subject per-worker
             raw = self._raw_cache.get(sub)
             if raw is None:
-                vhdr_path = os.path.join(self.bids_root, sub, "eeg", f"{sub}_task-rsvp_eeg.vhdr")
+                vhdr_path = ""
+                try:
+                    sid = int(self.ds_subject_ids[trial_index])
+                    vhdr_path = str(self.ds_vhdr_paths[sid]) if self.ds_vhdr_paths else ""
+                except Exception:
+                    vhdr_path = ""
+
+                if not vhdr_path:
+                    vhdr_path = os.path.join(self.bids_root, sub, "eeg", f"{sub}_task-rsvp_eeg.vhdr")
                 raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose="ERROR")
                 self._raw_cache[sub] = raw
 

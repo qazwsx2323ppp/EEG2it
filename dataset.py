@@ -103,6 +103,8 @@ def _ds003825_build_or_get_index(
         "subjects_raw_ok": 0,
         "subjects_events_ok": 0,
         "subjects_missing_columns": 0,
+        "subjects_too_short": 0,
+        "subjects_all_filtered": 0,
         "raw_errors": 0,
         "events_errors": 0,
         "trials_before_filter": 0,
@@ -110,6 +112,7 @@ def _ds003825_build_or_get_index(
         "small_eeg_files": 0,
     }
     missing_examples: list[dict] = []
+    filter_examples: list[dict] = []
 
     for sub in subjects:
         eeg_dir = os.path.join(bids_root, sub, "eeg")
@@ -213,18 +216,71 @@ def _ds003825_build_or_get_index(
 
         stats["trials_before_filter"] += int(len(dfe))
 
-        # Convert event timing to sample indices.
-        # NOTE: ds003825 events.tsv stores 'onset' in seconds (float), and also provides a 'sample' column.
-        if "sample" in dfe.columns:
-            sample_arr = pd.to_numeric(dfe["sample"], errors="coerce").fillna(-1).astype(int).to_numpy()
-        else:
-            onset_sec = pd.to_numeric(dfe["onset"], errors="coerce").fillna(-1.0).to_numpy()
-            sample_arr = np.rint(onset_sec * sfreq).astype(int)
-
         # Need 0..460ms window for later 20ms crop; require sample+win <= n_times.
         win = int(round(0.460 * sfreq))
         win = win if win > 0 else 460
-        ok = (sample_arr >= 0) & ((sample_arr + win) <= n_times)
+        if n_times <= win:
+            stats["subjects_too_short"] += 1
+            continue
+
+        def _to_int(arr) -> np.ndarray:
+            a = pd.to_numeric(arr, errors="coerce").to_numpy()
+            a = np.where(np.isfinite(a), a, -1.0)
+            return a.astype(np.int64)
+
+        def _to_sec_then_samples(arr) -> np.ndarray:
+            a = pd.to_numeric(arr, errors="coerce").to_numpy()
+            a = np.where(np.isfinite(a), a, -1.0)
+            return np.rint(a * sfreq).astype(np.int64)
+
+        # Convert event timing to sample indices.
+        # ds003825 has both:
+        #  - onset: seconds (float)
+        #  - sample: sometimes sample index, sometimes ms@1000Hz; choose the interpretation that yields usable trials.
+        candidates: list[tuple[str, np.ndarray]] = []
+        if "sample" in dfe.columns:
+            candidates.append(("sample_as_samples", _to_int(dfe["sample"])))
+            candidates.append(("sample_as_seconds", _to_sec_then_samples(dfe["sample"])))
+        if "onset" in dfe.columns:
+            candidates.append(("onset_as_seconds", _to_sec_then_samples(dfe["onset"])))
+            candidates.append(("onset_as_samples", _to_int(dfe["onset"])))
+
+        best_name = ""
+        best_samples = None
+        best_ok = None
+        best_count = -1
+        for name, arr in candidates:
+            ok = (arr >= 0) & ((arr + win) <= n_times)
+            cnt = int(ok.sum())
+            if cnt > best_count:
+                best_count = cnt
+                best_name = name
+                best_samples = arr
+                best_ok = ok
+
+        if best_samples is None or best_ok is None or best_count <= 0:
+            stats["subjects_all_filtered"] += 1
+            if len(filter_examples) < 3:
+                try:
+                    sample_col = dfe["sample"] if "sample" in dfe.columns else None
+                    onset_col = dfe["onset"] if "onset" in dfe.columns else None
+                    ex = {
+                        "subject": sub,
+                        "events_path": events_path,
+                        "vhdr_path": vhdr_path,
+                        "sfreq": float(sfreq),
+                        "n_times": int(n_times),
+                        "win": int(win),
+                        "onset_head": (onset_col.head(3).astype(str).tolist() if onset_col is not None else None),
+                        "sample_head": (sample_col.head(3).astype(str).tolist() if sample_col is not None else None),
+                    }
+                except Exception:
+                    ex = {"subject": sub, "events_path": events_path, "vhdr_path": vhdr_path, "sfreq": float(sfreq), "n_times": int(n_times), "win": int(win)}
+                filter_examples.append(ex)
+            continue
+
+        ok = best_ok
+        sample_arr = best_samples
         dfe = dfe.loc[ok]
         sample_arr = sample_arr[ok]
 
@@ -253,6 +309,7 @@ def _ds003825_build_or_get_index(
             f"trials_after_filter={stats['trials_after_filter']}, "
             f"small_eeg_files={stats['small_eeg_files']}). "
             f"missing_examples={missing_examples}. "
+            f"filter_examples={filter_examples}. "
             "Check DS003825_ROOT points to the BIDS root with real BrainVision .eeg data (not git-annex pointer files)."
         )
 

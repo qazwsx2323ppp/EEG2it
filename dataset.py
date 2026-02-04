@@ -102,12 +102,14 @@ def _ds003825_build_or_get_index(
         "subjects_with_files": 0,
         "subjects_raw_ok": 0,
         "subjects_events_ok": 0,
+        "subjects_missing_columns": 0,
         "raw_errors": 0,
         "events_errors": 0,
         "trials_before_filter": 0,
         "trials_after_filter": 0,
         "small_eeg_files": 0,
     }
+    missing_examples: list[dict] = []
 
     for sub in subjects:
         eeg_dir = os.path.join(bids_root, sub, "eeg")
@@ -133,15 +135,21 @@ def _ds003825_build_or_get_index(
         if not events_candidates or not vhdr_candidates:
             continue
 
-        # Prefer RSVP task if present.
-        def _prefer_rsvp(paths: list[str]) -> str:
-            for p in paths:
-                if "task-rsvp" in os.path.basename(p):
-                    return p
-            return paths[0]
+        def _choose_best(paths: list[str], prefer_tsv: bool = True) -> str:
+            def _score(p: str) -> tuple:
+                base = os.path.basename(p).lower()
+                is_rsvp = 0 if "task-rsvp" in base else 1
+                if prefer_tsv:
+                    ext_pri = 0 if base.endswith(".tsv") else 1
+                else:
+                    ext_pri = 0 if base.endswith(".vhdr") else 1
+                return (is_rsvp, ext_pri, base)
 
-        events_path = _prefer_rsvp(events_candidates)
-        vhdr_path = _prefer_rsvp(vhdr_candidates)
+            return sorted(paths, key=_score)[0]
+
+        # Prefer RSVP + TSV for events; prefer RSVP for VHDR.
+        events_path = _choose_best(events_candidates, prefer_tsv=True)
+        vhdr_path = _choose_best(vhdr_candidates, prefer_tsv=False)
 
         stats["subjects_with_files"] += 1
 
@@ -171,16 +179,23 @@ def _ds003825_build_or_get_index(
             continue
 
         try:
-            if events_path.lower().endswith(".csv"):
-                dfe = pd.read_csv(events_path)
-            else:
-                dfe = pd.read_csv(events_path, sep="\t")
+            # Auto-detect delimiter (tsv/csv) robustly.
+            dfe = pd.read_csv(events_path, sep=None, engine="python")
             stats["subjects_events_ok"] += 1
         except Exception:
             stats["events_errors"] += 1
             continue
 
         if "objectnumber" not in dfe.columns or "onset" not in dfe.columns:
+            stats["subjects_missing_columns"] += 1
+            if len(missing_examples) < 3:
+                missing_examples.append(
+                    {
+                        "subject": sub,
+                        "events_path": events_path,
+                        "columns": [str(c) for c in list(dfe.columns)[:30]],
+                    }
+                )
             continue
 
         if not include_teststim and "isteststim" in dfe.columns:
@@ -231,11 +246,13 @@ def _ds003825_build_or_get_index(
             f"subjects_with_files={stats['subjects_with_files']}, "
             f"subjects_raw_ok={stats['subjects_raw_ok']}, "
             f"subjects_events_ok={stats['subjects_events_ok']}, "
+            f"subjects_missing_columns={stats['subjects_missing_columns']}, "
             f"raw_errors={stats['raw_errors']}, "
             f"events_errors={stats['events_errors']}, "
             f"trials_before_filter={stats['trials_before_filter']}, "
             f"trials_after_filter={stats['trials_after_filter']}, "
             f"small_eeg_files={stats['small_eeg_files']}). "
+            f"missing_examples={missing_examples}. "
             "Check DS003825_ROOT points to the BIDS root with real BrainVision .eeg data (not git-annex pointer files)."
         )
 

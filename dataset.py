@@ -212,8 +212,17 @@ class TripletDataset(Dataset):
             self.zscore_eps = zscore_eps
             self.return_concept_id = return_concept_id
 
-            self.all_image_vectors = torch.from_numpy(np.load(cfg_data.image_vec_path)).float()
-            self.all_text_vectors = torch.from_numpy(np.load(cfg_data.text_vec_path)).float()
+            # Concept-level targets: [num_concepts, D]
+            # If stimuli images aren't available, text-only training can set image_vec_path to a missing/empty path.
+            text_np = np.load(cfg_data.text_vec_path)
+            image_path = _safe_getattr(cfg_data, "image_vec_path", "")
+            if image_path and os.path.isfile(image_path):
+                image_np = np.load(image_path)
+            else:
+                image_np = text_np
+
+            self.all_image_vectors = torch.from_numpy(image_np).float()
+            self.all_text_vectors = torch.from_numpy(text_np).float()
             self.num_available_vectors = min(len(self.all_image_vectors), len(self.all_text_vectors))
 
             # Splits: prefer explicit splits file; else split by subject deterministically.

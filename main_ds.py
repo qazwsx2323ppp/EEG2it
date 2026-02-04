@@ -5,6 +5,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import os
 import json
+import signal
+import sys
 from datetime import datetime
 
 import hydra
@@ -59,8 +61,84 @@ def _dist_cleanup():
         dist.destroy_process_group()
 
 
+def _dist_abort_best_effort():
+    """
+    Best-effort hard stop for DDP. Helpful when CTRL+C happens mid-iteration and
+    some ranks might otherwise hang in collectives.
+    """
+    try:
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        try:
+            # torch>=2.0 (backend dependent)
+            dist.abort()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _is_rank0(rank: int) -> bool:
     return rank == 0
+
+
+_STOP_REQUESTED = False
+
+
+def _install_signal_handlers():
+    """
+    Install handlers that:
+    - keep default SIGINT -> KeyboardInterrupt behavior (CTRL+C should stop immediately)
+    - still set a shared stop flag so loops can exit cleanly
+    """
+    prev_int = None
+    try:
+        prev_int = signal.getsignal(signal.SIGINT)
+    except Exception:
+        prev_int = None
+
+    def _handler_int(signum, frame):
+        global _STOP_REQUESTED
+        _STOP_REQUESTED = True
+        if callable(prev_int):
+            prev_int(signum, frame)  # likely raises KeyboardInterrupt
+        raise KeyboardInterrupt()
+
+    def _handler_term(signum, frame):
+        global _STOP_REQUESTED
+        _STOP_REQUESTED = True
+
+    try:
+        signal.signal(signal.SIGINT, _handler_int)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _handler_term)
+    except Exception:
+        pass
+
+
+def _stop_requested() -> bool:
+    return bool(_STOP_REQUESTED)
+
+
+def _dist_any_stop(device) -> bool:
+    """
+    If distributed is initialized, propagate stop/interrupt across ranks.
+    Returns True if any rank requested stop.
+    """
+    try:
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return _stop_requested()
+        flag = torch.tensor([1 if _stop_requested() else 0], device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.SUM)
+        return bool(flag.item() > 0)
+    except Exception:
+        return _stop_requested()
 
 
 def _maybe_init_wandb(cfg: DictConfig, enabled: bool, is_rank0: bool):
@@ -141,6 +219,8 @@ def train_one_epoch(
     opt_step = 0
     did_sanity = False
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", disable=rank != 0)):
+        if _dist_any_stop(device):
+            raise KeyboardInterrupt()
         eeg_signals, image_vecs, text_vecs, _ = _to_device(batch, device)
 
         with autocast_ctx:
@@ -150,7 +230,10 @@ def train_one_epoch(
             else:
                 eeg_img_embeddings, eeg_text_embeddings = outputs
 
-            loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+            if loss_fn_img is not None and alpha > 0:
+                loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+            else:
+                loss_img = torch.tensor(0.0, device=device)
             loss_txt = loss_fn_txt(eeg_text_embeddings, text_vecs)
             loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
 
@@ -204,6 +287,8 @@ def validate_loss_only(model, dataloader, loss_fn_img, loss_fn_txt, device, alph
     steps = 0
 
     for batch in tqdm(dataloader, desc="Validation", disable=rank != 0):
+        if _dist_any_stop(device):
+            raise KeyboardInterrupt()
         eeg_signals, image_vecs, text_vecs, _ = _to_device(batch, device)
         outputs = model(eeg_signals)
         if len(outputs) == 3:
@@ -211,7 +296,10 @@ def validate_loss_only(model, dataloader, loss_fn_img, loss_fn_txt, device, alph
         else:
             eeg_img_embeddings, eeg_text_embeddings = outputs
 
-        loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+        if loss_fn_img is not None and alpha > 0:
+            loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+        else:
+            loss_img = torch.tensor(0.0, device=device)
         loss_txt = loss_fn_txt(eeg_text_embeddings, text_vecs)
         loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
 
@@ -275,6 +363,8 @@ def evaluate_concept_retrieval(
     steps = 0
 
     for batch in tqdm(dataloader, desc="Validation", disable=rank != 0):
+        if _dist_any_stop(device):
+            raise KeyboardInterrupt()
         eeg_signals, image_vecs, text_vecs, concept_ids = _to_device(batch, device)
         if concept_ids is None:
             raise RuntimeError("Concept retrieval eval requires data.return_concept_id=true")
@@ -285,7 +375,7 @@ def evaluate_concept_retrieval(
         else:
             eeg_img_emb, eeg_txt_emb = outputs
 
-        loss_img = loss_fn_img(eeg_img_emb, image_vecs)
+        loss_img = loss_fn_img(eeg_img_emb, image_vecs) if (loss_fn_img is not None and alpha > 0) else torch.tensor(0.0, device=device)
         loss_txt = loss_fn_txt(eeg_txt_emb, text_vecs)
         loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
 
@@ -294,7 +384,8 @@ def evaluate_concept_retrieval(
         total_loss_txt += loss_txt.detach()
 
         concept_ids = concept_ids.long()
-        sums_img.index_add_(0, concept_ids, eeg_img_emb.float())
+        if loss_fn_img is not None and alpha > 0:
+            sums_img.index_add_(0, concept_ids, eeg_img_emb.float())
         sums_txt.index_add_(0, concept_ids, eeg_txt_emb.float())
         counts.index_add_(0, concept_ids, torch.ones_like(concept_ids, dtype=torch.float32))
 
@@ -305,11 +396,13 @@ def evaluate_concept_retrieval(
     if distributed:
         import torch.distributed as dist
 
-        dist.all_reduce(sums_img, op=dist.ReduceOp.SUM)
+        if loss_fn_img is not None and alpha > 0:
+            dist.all_reduce(sums_img, op=dist.ReduceOp.SUM)
         dist.all_reduce(sums_txt, op=dist.ReduceOp.SUM)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_loss_img, op=dist.ReduceOp.SUM)
+        if loss_fn_img is not None and alpha > 0:
+            dist.all_reduce(total_loss_img, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_loss_txt, op=dist.ReduceOp.SUM)
         steps_t = torch.tensor(float(steps), device=device)
         dist.all_reduce(steps_t, op=dist.ReduceOp.SUM)
@@ -334,10 +427,10 @@ def evaluate_concept_retrieval(
     target_img = target_img / (target_img.norm(dim=-1, keepdim=True) + 1e-12)
     target_txt = target_txt / (target_txt.norm(dim=-1, keepdim=True) + 1e-12)
 
-    sim_img = eeg_img_mean @ target_img.T
+    sim_img = (eeg_img_mean @ target_img.T) if (loss_fn_img is not None and alpha > 0) else None
     sim_txt = eeg_txt_mean @ target_txt.T
 
-    img_metrics = compute_retrieval_metrics(sim_img, k_values=k_values)
+    img_metrics = compute_retrieval_metrics(sim_img, k_values=k_values) if sim_img is not None else None
     txt_metrics = compute_retrieval_metrics(sim_txt, k_values=k_values)
 
     # Also report how many concepts are actually present in eval
@@ -351,6 +444,31 @@ def evaluate_concept_retrieval(
         "present_concepts": present,
         "steps": steps,
     }
+
+
+def _get_metric_from_val(val_results: dict, metric: str) -> float:
+    metric = metric.strip()
+    if metric in {"val/loss_total", "loss", "val_loss"}:
+        return float(val_results["loss"])
+    if metric == "val/txt_top1":
+        return float(val_results["txt_metrics"]["top_1_accuracy"])
+    if metric == "val/txt_top5":
+        return float(val_results["txt_metrics"]["top_5_accuracy"])
+    if metric == "val/txt_top10":
+        return float(val_results["txt_metrics"]["top_10_accuracy"])
+    if metric == "val/img_top1":
+        if val_results.get("img_metrics") is None:
+            return float("-inf")
+        return float(val_results["img_metrics"]["top_1_accuracy"])
+    if metric == "val/img_top5":
+        if val_results.get("img_metrics") is None:
+            return float("-inf")
+        return float(val_results["img_metrics"]["top_5_accuracy"])
+    if metric == "val/img_top10":
+        if val_results.get("img_metrics") is None:
+            return float("-inf")
+        return float(val_results["img_metrics"]["top_10_accuracy"])
+    raise ValueError(f"Unknown metric: {metric}")
 
 
 def check_parameter_updates(model):
@@ -379,6 +497,7 @@ def check_parameter_updates(model):
 @hydra.main(version_base=None, config_path="configs", config_name="ds003825_triplet_config")
 def main(cfg: DictConfig):
     torch.backends.cudnn.benchmark = True
+    _install_signal_handlers()
 
     distributed = _dist_enabled(cfg)
     rank = 0
@@ -492,13 +611,16 @@ def main(cfg: DictConfig):
         persistent_workers=persistent_workers,
     )
 
-    loss_fn_img = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+    text_only = bool(cfg.training.get("text_only", False))
+    alpha = 0.0 if text_only else float(cfg.training.alpha)
+
+    loss_fn_img = None if text_only else InfoNCE(initial_temperature=cfg.training.temperature).to(device)
     loss_fn_txt = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
 
     # Keep the same parameter-freezing policy as main.py
     params_backbone_active = []
     params_head = []
-    loss_params = list(loss_fn_img.parameters()) + list(loss_fn_txt.parameters())
+    loss_params = (list(loss_fn_txt.parameters()) if loss_fn_img is None else (list(loss_fn_img.parameters()) + list(loss_fn_txt.parameters())))
 
     named_params = model.named_parameters() if not distributed else model.module.named_parameters()
     for name, param in named_params:
@@ -541,8 +663,14 @@ def main(cfg: DictConfig):
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
-    best_val = float("inf")
+    selection_metric = str(cfg.training.get("selection_metric", "val/txt_top1"))
+    selection_mode = str(cfg.training.get("selection_mode", "max")).lower()  # max or min
+    if selection_mode not in {"max", "min"}:
+        raise ValueError("training.selection_mode must be 'max' or 'min'")
+
+    best_score = float("-inf") if selection_mode == "max" else float("inf")
     best_epoch = -1
+    best_val_loss = float("inf")
     early_stop_enabled = bool(cfg.training.get("early_stopping", True))
     patience = int(cfg.training.get("patience", 10))
     min_delta = float(cfg.training.get("min_delta", 0.0))
@@ -566,7 +694,7 @@ def main(cfg: DictConfig):
             loss_fn_img,
             loss_fn_txt,
             device,
-            float(cfg.training.alpha),
+            float(alpha),
             scaler,
             scheduler,
             grad_accum_steps=grad_accum_steps,
@@ -584,7 +712,7 @@ def main(cfg: DictConfig):
             loss_fn_img=loss_fn_img,
             loss_fn_txt=loss_fn_txt,
             device=device,
-            alpha=float(cfg.training.alpha),
+            alpha=float(alpha),
             max_steps=val_max_steps if val_max_steps not in (0, None) else None,
             num_concepts=int(cfg.data.get("num_concepts", 1854)),
             embedding_dim=int(cfg.model.embedding_dim),
@@ -602,6 +730,7 @@ def main(cfg: DictConfig):
             epoch_metrics = {
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "epoch": epoch,
+                "text_only": bool(text_only),
                 "train": {
                     "loss_total": train_loss,
                     "loss_image": train_loss_img,
@@ -618,6 +747,8 @@ def main(cfg: DictConfig):
                     "txt_metrics": val_results["txt_metrics"],
                 },
                 "lr": float(optimizer.param_groups[0]["lr"]),
+                "selection_metric": selection_metric,
+                "selection_mode": selection_mode,
             }
             _append_jsonl(metrics_jsonl, epoch_metrics)
 
@@ -634,9 +765,9 @@ def main(cfg: DictConfig):
                         "val/loss_text": val_loss_txt,
                         "val/steps": val_steps,
                         "val/present_concepts": val_results.get("present_concepts", 0),
-                        "val/img_top1": val_results["img_metrics"]["top_1_accuracy"],
-                        "val/img_top5": val_results["img_metrics"]["top_5_accuracy"],
-                        "val/img_top10": val_results["img_metrics"]["top_10_accuracy"],
+                        "val/img_top1": (0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"]["top_1_accuracy"]),
+                        "val/img_top5": (0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"]["top_5_accuracy"]),
+                        "val/img_top10": (0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"]["top_10_accuracy"]),
                         "val/txt_top1": val_results["txt_metrics"]["top_1_accuracy"],
                         "val/txt_top5": val_results["txt_metrics"]["top_5_accuracy"],
                         "val/txt_top10": val_results["txt_metrics"]["top_10_accuracy"],
@@ -645,34 +776,44 @@ def main(cfg: DictConfig):
                 )
 
             if bool(cfg.training.get("print_epoch_losses", True)):
-                print(
-                    f"[epoch {epoch}] "
-                    f"train total={train_loss:.4f} img={train_loss_img:.4f} txt={train_loss_txt:.4f} | "
-                    f"val total={val_loss:.4f} img={val_loss_img:.4f} txt={val_loss_txt:.4f} | "
-                    f"val img@1={val_results['img_metrics']['top_1_accuracy']*100:.2f}% "
-                    f"txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% | "
-                    f"steps={steps}"
-                )
+                if text_only:
+                    print(
+                        f"[epoch {epoch}] "
+                        f"train total={train_loss:.4f} txt={train_loss_txt:.4f} | "
+                        f"val total={val_loss:.4f} txt={val_loss_txt:.4f} | "
+                        f"val txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% | "
+                        f"steps={steps}"
+                    )
+                else:
+                    print(
+                        f"[epoch {epoch}] "
+                        f"train total={train_loss:.4f} img={train_loss_img:.4f} txt={train_loss_txt:.4f} | "
+                        f"val total={val_loss:.4f} img={val_loss_img:.4f} txt={val_loss_txt:.4f} | "
+                        f"val img@1={(0.0 if val_results.get('img_metrics') is None else val_results['img_metrics']['top_1_accuracy']*100):.2f}% "
+                        f"txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% | "
+                        f"steps={steps}"
+                    )
             else:
                 print(f"[epoch {epoch}] train={train_loss:.4f} val={val_loss:.4f} (steps={steps})")
 
-            prev_best = best_val
-            if val_loss < best_val:
-                best_val = val_loss
+            score = _get_metric_from_val(val_results, selection_metric)
+            improved = (score > best_score + min_delta) if selection_mode == "max" else (score < best_score - min_delta)
+            if improved:
+                best_score = score
                 best_epoch = epoch
+                best_val_loss = val_loss
                 out_path = os.path.join(run_dir, "best_eeg_encoder_ds003825.pth")
                 state = model.module.state_dict() if distributed else model.state_dict()
                 torch.save(state, out_path)
-                print(f"保存 best checkpoint: {out_path}")
+                print(f"保存 best checkpoint: {out_path} ({selection_metric}={score:.6f})")
 
             if early_stop_enabled:
-                improvement = prev_best - val_loss
-                if improvement > min_delta:
+                if improved:
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
                 if epochs_no_improve >= patience:
-                    print(f"EarlyStopping: val_loss 未改善达到 {patience} 个 epoch（min_delta={min_delta}），停止训练。")
+                    print(f"EarlyStopping: {selection_metric} 未改善达到 {patience} 个 epoch（min_delta={min_delta}），停止训练。")
                     stop_now = True
 
         if distributed:
@@ -687,15 +828,19 @@ def main(cfg: DictConfig):
 
     if is_rank0:
         summary = {
-            "best_val_loss": best_val,
+            "best_val_loss": best_val_loss,
             "best_epoch": best_epoch,
+            "best_score": best_score,
+            "selection_metric": selection_metric,
+            "selection_mode": selection_mode,
             "run_dir": run_dir,
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
         _write_json(metrics_summary_path, summary)
         with open(metrics_txt_path, "w", encoding="utf-8") as f:
             f.write(f"best_epoch: {best_epoch}\n")
-            f.write(f"best_val_loss: {best_val}\n")
+            f.write(f"best_val_loss: {best_val_loss}\n")
+            f.write(f"best_score ({selection_metric}): {best_score}\n")
             f.write(f"metrics_epoch_jsonl: {metrics_jsonl}\n")
             f.write(f"best_checkpoint: {os.path.join(run_dir, 'best_eeg_encoder_ds003825.pth')}\n")
         if wandb is not None:
@@ -704,4 +849,15 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        _, rank, _ = _get_dist_env()
+        if rank == 0:
+            print("[exit] KeyboardInterrupt received, aborting DDP...")
+        _dist_abort_best_effort()
+        try:
+            _dist_cleanup()
+        except Exception:
+            pass
+        os._exit(130)

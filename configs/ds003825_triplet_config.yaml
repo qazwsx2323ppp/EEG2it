@@ -56,11 +56,16 @@ training:
   print_epoch_losses: true
   sanity_check: true
   early_stopping: true
+  # 仅做 text 语义对齐（不使用 image 分支）；此时会自动 alpha=0 且跳过 image retrieval 指标
+  text_only: true
+  # 以 Top-k 指标作为「保存 best / 早停」的主导指标
+  selection_metric: "val/txt_top1"
+  selection_mode: "max"
   use_wandb: false
   k_values: [1, 5, 10]
 
   # 大数据集训练建议：限制每个 epoch 的迭代步数（想跑全量就设为 0 或删除）
-  max_steps_per_epoch: 2000
+  max_steps_per_epoch: 500
   max_val_steps: 200
   grad_accum_steps: 1
   log_every: 50
@@ -70,8 +75,9 @@ training:
     enabled: true
     backend: "nccl"
     find_unused_parameters: true
-  patience: 10
-  min_delta: 0.01
+  patience: 5
+  # Top-1 是 [0,1] 的小数；min_delta 设太大会导致「Top-1 变好但不保存」
+  min_delta: 0.0001
   weight_decay: 0.1
   alpha: 0.5            # 方案一：image_vec/text_vec 来自不同 prompt，可用双头共同训练
   temperature: 0.2

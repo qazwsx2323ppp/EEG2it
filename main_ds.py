@@ -430,11 +430,25 @@ def evaluate_concept_retrieval(
     sim_img = (eeg_img_mean @ target_img.T) if (loss_fn_img is not None and alpha > 0) else None
     sim_txt = eeg_txt_mean @ target_txt.T
 
-    img_metrics = compute_retrieval_metrics(sim_img, k_values=k_values) if sim_img is not None else None
-    txt_metrics = compute_retrieval_metrics(sim_txt, k_values=k_values)
+    # Evaluate retrieval only over concepts actually present in this split.
+    present_mask = counts > 0
+    present_idx = present_mask.nonzero(as_tuple=False).squeeze(1)
+    present = int(present_idx.numel())
 
-    # Also report how many concepts are actually present in eval
-    present = int((counts > 0).sum().item())
+    if present >= 2:
+        sim_txt_eval = sim_txt[present_idx][:, present_idx]
+        txt_metrics = compute_retrieval_metrics(sim_txt_eval, k_values=k_values)
+
+        if sim_img is not None:
+            sim_img_eval = sim_img[present_idx][:, present_idx]
+            img_metrics = compute_retrieval_metrics(sim_img_eval, k_values=k_values)
+        else:
+            img_metrics = None
+    else:
+        # Not enough concepts for meaningful retrieval. Report zeros.
+        txt_metrics = {f"top_{k}_accuracy": 0.0 for k in k_values}
+        txt_metrics.update({"mean_positive_similarity": 0.0, "mean_negative_similarity": 0.0, "separation_ratio": 0.0})
+        img_metrics = None
     return {
         "loss": avg_loss,
         "loss_img": avg_loss_img,

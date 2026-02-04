@@ -49,7 +49,7 @@ def _ds003825_build_or_get_index(
     Returns dict with:
       - subjects: list[str]
       - subject_ids: torch.uint8 [N]
-      - onsets: torch.int32 [N]  (ms @ 1000Hz ~= samples)
+      - samples: torch.int32 [N]  (sample index at the EEG sampling rate)
       - concept_ids: torch.int16 [N] (objectnumber 0..1853)
     """
     key = (
@@ -92,7 +92,7 @@ def _ds003825_build_or_get_index(
     subject_to_id = {s: i for i, s in enumerate(subjects)}
 
     subject_ids: list[int] = []
-    onsets: list[int] = []
+    samples: list[int] = []
     concept_ids: list[int] = []
 
     for sub in subjects:
@@ -105,6 +105,7 @@ def _ds003825_build_or_get_index(
         # Use raw length to drop out-of-range epochs early.
         raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose="ERROR")
         n_times = int(raw.n_times)
+        sfreq = float(getattr(raw.info, "sfreq", raw.info.get("sfreq", 1000.0)))
         raw.close()
 
         dfe = pd.read_csv(events_path, sep="\t")
@@ -125,18 +126,27 @@ def _ds003825_build_or_get_index(
         if trial_stride and trial_stride > 1:
             dfe = dfe.iloc[::trial_stride, :]
 
-        # Need 0..460ms window (460 samples) for later 20:460 crop
-        # stop is exclusive, so require onset+460 <= n_times
-        onset_arr = dfe["onset"].astype(int).to_numpy()
-        ok = (onset_arr >= 0) & ((onset_arr + 460) <= n_times)
+        # Convert event timing to sample indices.
+        # NOTE: ds003825 events.tsv stores 'onset' in seconds (float), and also provides a 'sample' column.
+        if "sample" in dfe.columns:
+            sample_arr = pd.to_numeric(dfe["sample"], errors="coerce").fillna(-1).astype(int).to_numpy()
+        else:
+            onset_sec = pd.to_numeric(dfe["onset"], errors="coerce").fillna(-1.0).to_numpy()
+            sample_arr = np.rint(onset_sec * sfreq).astype(int)
+
+        # Need 0..460ms window for later 20ms crop; require sample+win <= n_times.
+        win = int(round(0.460 * sfreq))
+        win = win if win > 0 else 460
+        ok = (sample_arr >= 0) & ((sample_arr + win) <= n_times)
         dfe = dfe.loc[ok]
+        sample_arr = sample_arr[ok]
 
         if len(dfe) == 0:
             continue
 
         sid = subject_to_id[sub]
         subject_ids.extend([sid] * len(dfe))
-        onsets.extend(dfe["onset"].astype(int).tolist())
+        samples.extend(sample_arr.tolist())
         concept_ids.extend(dfe["objectnumber"].astype(int).tolist())
 
     if not subject_ids:
@@ -145,7 +155,7 @@ def _ds003825_build_or_get_index(
     index = {
         "subjects": subjects,
         "subject_ids": torch.tensor(subject_ids, dtype=torch.uint8),
-        "onsets": torch.tensor(onsets, dtype=torch.int32),
+        "samples": torch.tensor(samples, dtype=torch.int32),
         "concept_ids": torch.tensor(concept_ids, dtype=torch.int16),
     }
     _DS003825_INDEX_CACHE[key] = index
@@ -204,7 +214,7 @@ class TripletDataset(Dataset):
 
             self.ds_subjects = index["subjects"]
             self.ds_subject_ids = index["subject_ids"]
-            self.ds_onsets = index["onsets"]
+            self.ds_samples = index["samples"]
             self.ds_concept_ids = index["concept_ids"]
             self.target_channels = target_channels
             self.bids_root = bids_root
@@ -336,7 +346,7 @@ class TripletDataset(Dataset):
 
             trial_index = int(self.indices[idx])
             sub = self.ds_subjects[int(self.ds_subject_ids[trial_index])]
-            onset = int(self.ds_onsets[trial_index])
+            sample = int(self.ds_samples[trial_index])
             concept = int(self.ds_concept_ids[trial_index])
 
             # Load/cached BrainVision raw per-subject per-worker
@@ -346,11 +356,17 @@ class TripletDataset(Dataset):
                 raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose="ERROR")
                 self._raw_cache[sub] = raw
 
-            # Extract 0..460ms then apply the same 20:460 crop
-            seg = raw.get_data(start=onset, stop=onset + 460, picks="eeg").astype(np.float32, copy=False)
+            # Extract 0..460ms then apply the same 20ms crop (drop early artifact)
+            sfreq = float(getattr(raw.info, "sfreq", raw.info.get("sfreq", 1000.0)))
+            win = int(round(0.460 * sfreq))
+            win = win if win > 0 else 460
+            crop = int(round(0.020 * sfreq))
+            crop = crop if crop >= 0 else 0
+
+            seg = raw.get_data(start=sample, stop=sample + win, picks="eeg").astype(np.float32, copy=False)
 
             eeg_signal = seg.T  # (Time, Channel)
-            eeg_signal = eeg_signal[20:460, :]
+            eeg_signal = eeg_signal[crop:, :]
             eeg_signal = eeg_signal.T  # (Channel, Time) -> (63, 440)
 
             target_length = 512

@@ -477,7 +477,7 @@ class Ds003825TripletDataset(Dataset):
             n_channels_out=self.n_channels_out,
             verbose=False,
         )
-        torch.save(tensors, path)
+        torch.save(tensors, path, _use_new_zipfile_serialization=True)
 
     def _load_subject(self, subject: str) -> Dict[str, torch.Tensor]:
         cached = self._lru.get(subject)
@@ -485,7 +485,10 @@ class Ds003825TripletDataset(Dataset):
             return cached
         self._ensure_subject_cached(subject)
         path = self._cache_path(subject)
-        obj = torch.load(path, map_location="cpu")
+        # PyTorch>=2.6 defaults torch.load(weights_only=True) for security, which can
+        # fail for cache files saved in legacy format. These cache files are produced
+        # locally by this script, so it is safe to load with weights_only=False.
+        obj = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(obj, dict) or "eeg" not in obj or "concept_id" not in obj:
             raise ValueError(f"Bad cache file: {path}")
         self._lru.put(subject, obj)
@@ -520,7 +523,7 @@ class Ds003825TripletDataset(Dataset):
 
             for sub in use:
                 self._ensure_subject_cached(sub)
-                obj = torch.load(self._cache_path(sub), map_location="cpu")
+                obj = torch.load(self._cache_path(sub), map_location="cpu", weights_only=False)
                 n_epochs = int(obj["eeg"].shape[0])
                 concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
                 for i in range(n_epochs):
@@ -533,7 +536,7 @@ class Ds003825TripletDataset(Dataset):
         all_trials: List[_TrialRef] = []
         for sub in self.subjects:
             self._ensure_subject_cached(sub)
-            obj = torch.load(self._cache_path(sub), map_location="cpu")
+            obj = torch.load(self._cache_path(sub), map_location="cpu", weights_only=False)
             n_epochs = int(obj["eeg"].shape[0])
             concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
             for i in range(n_epochs):

@@ -555,8 +555,17 @@ def main(cfg: DictConfig):
         )
 
     split_index = int(cfg.data.get("split_index", 0))
-    train_dataset = TripletDataset(cfg.data, mode="train", split_index=split_index)
-    val_dataset = TripletDataset(cfg.data, mode="val", split_index=split_index)
+
+    # Select dataset implementation without modifying legacy dataset.py.
+    dataset_impl = str(cfg.data.get("dataset_impl", "")).strip().lower()
+    if dataset_impl in {"ds003825_bids", "bids_paper", "dataset_ds"} or str(cfg.data.get("backend", "")).lower() in {"ds003825_bids", "bids_paper"}:
+        from dataset_ds import Ds003825TripletDataset as _TripletDataset
+
+        train_dataset = _TripletDataset(cfg.data, mode="train", split_index=split_index)
+        val_dataset = _TripletDataset(cfg.data, mode="val", split_index=split_index)
+    else:
+        train_dataset = TripletDataset(cfg.data, mode="train", split_index=split_index)
+        val_dataset = TripletDataset(cfg.data, mode="val", split_index=split_index)
 
     use_unique_concepts = bool(cfg.data.get("unique_concepts_per_batch", False)) and getattr(train_dataset, "backend", "") == "ds003825"
 

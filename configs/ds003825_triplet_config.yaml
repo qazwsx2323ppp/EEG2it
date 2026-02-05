@@ -20,8 +20,24 @@ data:
   num_concepts: 1854
 
   # 关键：指向 BIDS 根目录（可用环境变量覆盖，避免换机器就改 yaml）
-  backend: "ds003825"
+  backend: "ds003825_bids"
+  dataset_impl: "ds003825_bids"
   eeg_path: ${oc.env:DS003825_ROOT,${data.root}/data/ds003825}
+
+  # (论文规则) 预处理与 epoch 参数（dataset_ds.py 会读取这些值）
+  l_freq: 0.1
+  h_freq: 100.0
+  resample_sfreq: 250.0
+  tmin: -0.1
+  tmax: 1.0
+  n_channels_out: 64
+  baseline_correction: false
+  exclude_targets: true
+  split_by: "subject"     # subject | trial
+  subject_split: [0.8, 0.1, 0.1]
+  trial_split: [0.8, 0.1, 0.1]
+  cache_dir: ${data.root}/data/ds003825_cache_paper
+  lru_subjects: 2
 
   # 概念级向量（objectnumber 0..1853），推荐先用 text-only 方案：
   #  - out-text 生成到 data/ds003825_concept_text.npy

@@ -201,6 +201,7 @@ def _preproc_and_epoch_subject(
     resample_sfreq: float,
     tmin: float,
     tmax: float,
+    n_channels_epoch: int,
     n_channels_out: int,
     verbose: bool,
 ) -> Dict[str, torch.Tensor]:
@@ -378,12 +379,23 @@ def _preproc_and_epoch_subject(
         )
 
     data = epochs.get_data().astype(np.float32, copy=False)  # [N, C, T]
-    # Enforce C=64 (pad or truncate).
+    # Paper typically uses 64 channels, while the DreamDiffusion backbone expects 128.
+    # First enforce "epoch channels" (e.g. 64), then pad/truncate to "output channels" for the model (e.g. 128).
     n, c, t = data.shape
-    if c < n_channels_out:
-        pad = np.zeros((n, n_channels_out - c, t), dtype=np.float32)
+    n_channels_epoch = int(n_channels_epoch)
+    n_channels_out = int(n_channels_out)
+
+    if c < n_channels_epoch:
+        pad = np.zeros((n, n_channels_epoch - c, t), dtype=np.float32)
         data = np.concatenate([data, pad], axis=1)
-    elif c > n_channels_out:
+    elif c > n_channels_epoch:
+        data = data[:, :n_channels_epoch, :]
+
+    c2 = int(data.shape[1])
+    if c2 < n_channels_out:
+        pad = np.zeros((n, n_channels_out - c2, t), dtype=np.float32)
+        data = np.concatenate([data, pad], axis=1)
+    elif c2 > n_channels_out:
         data = data[:, :n_channels_out, :]
 
     if verbose and _is_rank0():
@@ -425,7 +437,8 @@ class Ds003825TripletDataset(Dataset):
         self.resample_sfreq = float(_safe_get(cfg_data, "resample_sfreq", 250.0))
         self.tmin = float(_safe_get(cfg_data, "tmin", -0.1))
         self.tmax = float(_safe_get(cfg_data, "tmax", 1.0))
-        self.n_channels_out = int(_safe_get(cfg_data, "n_channels_out", 64))
+        self.n_channels_epoch = int(_safe_get(cfg_data, "n_channels_epoch", 64))
+        self.n_channels_out = int(_safe_get(cfg_data, "n_channels_out", 128))
 
         # Cache
         cache_dir = _safe_get(cfg_data, "cache_dir", None)
@@ -469,11 +482,19 @@ class Ds003825TripletDataset(Dataset):
 
     def _cache_path(self, subject: str) -> str:
         ext = "pt" if self.cache_format == "pt" else "npy"
-        fname = f"{subject}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.{ext}"
+        ch_tag = f"ch{int(self.n_channels_epoch)}to{int(self.n_channels_out)}"
+        fname = (
+            f"{subject}_{ch_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
+            f"_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.{ext}"
+        )
         return os.path.join(self.cache_dir, fname)
 
     def _cache_paths(self, subject: str) -> Dict[str, str]:
-        base = f"{subject}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}"
+        ch_tag = f"ch{int(self.n_channels_epoch)}to{int(self.n_channels_out)}"
+        base = (
+            f"{subject}_{ch_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
+            f"_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}"
+        )
         if self.cache_format == "pt":
             return {"pt": os.path.join(self.cache_dir, f"{base}.pt")}
         return {
@@ -561,6 +582,7 @@ class Ds003825TripletDataset(Dataset):
                 resample_sfreq=self.resample_sfreq,
                 tmin=self.tmin,
                 tmax=self.tmax,
+                n_channels_epoch=self.n_channels_epoch,
                 n_channels_out=self.n_channels_out,
                 verbose=False,
             )

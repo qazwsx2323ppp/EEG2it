@@ -11,6 +11,8 @@ data:
   exclude_subjects: ""
   # With only 2 subjects, ensure train/val are non-empty.
   subject_split: [0.5, 0.5, 0.0]
+  n_channels_epoch: 64
+  n_channels_out: 128
 
 training:
   epochs: 10

@@ -20,7 +20,8 @@ def main():
     ap.add_argument("--resample-sfreq", type=float, default=250.0)
     ap.add_argument("--tmin", type=float, default=-0.1)
     ap.add_argument("--tmax", type=float, default=1.0)
-    ap.add_argument("--n-channels-out", type=int, default=64)
+    ap.add_argument("--n-channels-epoch", type=int, default=64, help="Real EEG channels after picks (paper uses 64).")
+    ap.add_argument("--n-channels-out", type=int, default=128, help="Channels fed to model (DreamDiffusion expects 128).")
     args = ap.parse_args()
 
     os.makedirs(args.cache_dir, exist_ok=True)
@@ -43,6 +44,7 @@ def main():
         "resample_sfreq": float(args.resample_sfreq),
         "tmin": float(args.tmin),
         "tmax": float(args.tmax),
+        "n_channels_epoch": int(args.n_channels_epoch),
         "n_channels_out": int(args.n_channels_out),
         # Build cache only; splits don't matter here.
         "split_by": "subject",
@@ -60,4 +62,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -37,6 +37,7 @@ data:
   subject_split: [0.8, 0.1, 0.1]
   trial_split: [0.8, 0.1, 0.1]
   cache_dir: ${data.root}/data/ds003825_cache_paper
+  cache_format: "npy"
   lru_subjects: 2
 
   # 概念级向量（objectnumber 0..1853），推荐先用 text-only 方案：

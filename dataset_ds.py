@@ -435,8 +435,20 @@ class Ds003825TripletDataset(Dataset):
             cache_dir = os.path.join(os.path.dirname(__file__), "data", "cache", f"ds003825_{_sha1(tag)[:10]}")
         self.cache_dir = os.path.abspath(str(cache_dir))
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_format = str(_safe_get(cfg_data, "cache_format", "npy")).lower()  # npy | pt
 
         self.subjects = _discover_subjects(self.bids_root)
+        # Optional: restrict to a subset of subjects for quick runs.
+        subjects_csv = _safe_get(cfg_data, "subjects", "")
+        if subjects_csv:
+            allowed = {s.strip() for s in str(subjects_csv).split(",") if s.strip()}
+            self.subjects = [s for s in self.subjects if s in allowed]
+        exclude_csv = _safe_get(cfg_data, "exclude_subjects", "")
+        if exclude_csv:
+            excluded = {s.strip() for s in str(exclude_csv).split(",") if s.strip()}
+            self.subjects = [s for s in self.subjects if s not in excluded]
+        if not self.subjects:
+            raise ValueError("No subjects left after applying subjects/exclude_subjects filters.")
 
         # Split configuration
         self.split_by = str(_safe_get(cfg_data, "split_by", "subject")).lower()  # subject|trial
@@ -445,8 +457,8 @@ class Ds003825TripletDataset(Dataset):
         self.subject_split = tuple(_safe_get(cfg_data, "subject_split", (0.8, 0.1, 0.1)))
         self.trial_split = tuple(_safe_get(cfg_data, "trial_split", (0.8, 0.1, 0.1)))
 
-        # LRU cache for subject tensors
-        self._lru = _SubjectLRU(max_subjects=int(_safe_get(cfg_data, "lru_subjects", 2)))
+        # LRU cache for subject tensors (note: each DataLoader worker has its own Dataset copy)
+        self._lru = _SubjectLRU(max_subjects=int(_safe_get(cfg_data, "lru_subjects", 1)))
 
         # Build index of trials (lazy load subject caches when needed)
         self._trials: List[_TrialRef] = []
@@ -456,8 +468,18 @@ class Ds003825TripletDataset(Dataset):
             print(f"[ds003825] mode={self.mode} trials={len(self._trials)} cache_dir={self.cache_dir}")
 
     def _cache_path(self, subject: str) -> str:
-        fname = f"{subject}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.pt"
+        ext = "pt" if self.cache_format == "pt" else "npy"
+        fname = f"{subject}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.{ext}"
         return os.path.join(self.cache_dir, fname)
+
+    def _cache_paths(self, subject: str) -> Dict[str, str]:
+        base = f"{subject}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}"
+        if self.cache_format == "pt":
+            return {"pt": os.path.join(self.cache_dir, f"{base}.pt")}
+        return {
+            "eeg": os.path.join(self.cache_dir, f"{base}_eeg.npy"),
+            "concept": os.path.join(self.cache_dir, f"{base}_concept.npy"),
+        }
 
     def _lock_path(self, subject: str) -> str:
         return self._cache_path(subject) + ".lock"
@@ -488,13 +510,28 @@ class Ds003825TripletDataset(Dataset):
         Load cache dict. If the cache is corrupted/partial (common under concurrent writes),
         raise so caller can rebuild it.
         """
-        return torch.load(path, map_location="cpu", weights_only=False)
+        if self.cache_format == "pt":
+            return torch.load(path, map_location="cpu", weights_only=False)
+        raise RuntimeError("Use _safe_load_cache_npy for npy cache format")
+
+    def _safe_load_cache_npy(self, paths: Dict[str, str]) -> Dict[str, Any]:
+        eeg_path = paths["eeg"]
+        concept_path = paths["concept"]
+        if not (os.path.isfile(eeg_path) and os.path.isfile(concept_path)):
+            raise FileNotFoundError(f"Missing cache files: {eeg_path} / {concept_path}")
+        eeg_mm = np.load(eeg_path, mmap_mode="r")  # [N,C,T] float32 memmap
+        concept_np = np.load(concept_path)  # small, load fully
+        return {"eeg_mm": eeg_mm, "concept_id": torch.from_numpy(concept_np).to(torch.int16)}
 
     def _ensure_subject_cached(self, subject: str) -> None:
-        path = self._cache_path(subject)
+        paths = self._cache_paths(subject)
         # Fast path
-        if os.path.isfile(path):
-            return
+        if self.cache_format == "pt":
+            if os.path.isfile(paths["pt"]):
+                return
+        else:
+            if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
+                return
 
         lock_path = self._lock_path(subject)
         got = self._acquire_lock(lock_path)
@@ -503,11 +540,16 @@ class Ds003825TripletDataset(Dataset):
 
         try:
             # Another rank may have created it while we waited.
-            if os.path.isfile(path):
-                return
+            if self.cache_format == "pt":
+                if os.path.isfile(paths["pt"]):
+                    return
+            else:
+                if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
+                    return
 
             if _is_rank0():
-                print(f"[ds003825] caching {subject} -> {path}")
+                target = paths["pt"] if self.cache_format == "pt" else paths["eeg"]
+                print(f"[ds003825] caching {subject} -> {target}")
 
             tensors = _preproc_and_epoch_subject(
                 self.bids_root,
@@ -523,9 +565,22 @@ class Ds003825TripletDataset(Dataset):
                 verbose=False,
             )
 
-            tmp = f"{path}.tmp.{os.getpid()}"
-            torch.save(tensors, tmp, _use_new_zipfile_serialization=True)
-            os.replace(tmp, path)  # atomic on POSIX
+            if self.cache_format == "pt":
+                path = paths["pt"]
+                tmp = f"{path}.tmp.{os.getpid()}"
+                torch.save(tensors, tmp, _use_new_zipfile_serialization=True)
+                os.replace(tmp, path)  # atomic on POSIX
+            else:
+                eeg = tensors["eeg"].numpy().astype(np.float32, copy=False)
+                concept = tensors["concept_id"].numpy().astype(np.int16, copy=False)
+                eeg_path = paths["eeg"]
+                concept_path = paths["concept"]
+                eeg_tmp = f"{eeg_path}.tmp.{os.getpid()}"
+                concept_tmp = f"{concept_path}.tmp.{os.getpid()}"
+                np.save(eeg_tmp, eeg)
+                np.save(concept_tmp, concept)
+                os.replace(eeg_tmp, eeg_path)
+                os.replace(concept_tmp, concept_path)
         finally:
             self._release_lock(lock_path)
 
@@ -534,46 +589,20 @@ class Ds003825TripletDataset(Dataset):
         if cached is not None:
             return cached
         self._ensure_subject_cached(subject)
-        path = self._cache_path(subject)
-        try:
+        paths = self._cache_paths(subject)
+
+        if self.cache_format == "pt":
+            path = paths["pt"]
             obj = self._safe_load_cache(path)
-        except Exception:
-            # Cache is likely corrupted/partial from a previous concurrent write. Rebuild it under a lock.
-            lock_path = self._lock_path(subject)
-            got = self._acquire_lock(lock_path)
-            if not got:
-                raise
-            try:
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                except Exception:
-                    pass
-                if _is_rank0():
-                    print(f"[ds003825] rebuilt corrupted cache: {path}")
-                tensors = _preproc_and_epoch_subject(
-                    self.bids_root,
-                    subject,
-                    baseline_correction=self.baseline_correction,
-                    exclude_targets=self.exclude_targets,
-                    l_freq=self.l_freq,
-                    h_freq=self.h_freq,
-                    resample_sfreq=self.resample_sfreq,
-                    tmin=self.tmin,
-                    tmax=self.tmax,
-                    n_channels_out=self.n_channels_out,
-                    verbose=False,
-                )
-                tmp = f"{path}.tmp.{os.getpid()}"
-                torch.save(tensors, tmp, _use_new_zipfile_serialization=True)
-                os.replace(tmp, path)
-            finally:
-                self._release_lock(lock_path)
-            obj = self._safe_load_cache(path)
-        if not isinstance(obj, dict) or "eeg" not in obj or "concept_id" not in obj:
-            raise ValueError(f"Bad cache file: {path}")
-        self._lru.put(subject, obj)
-        return obj
+            if not isinstance(obj, dict) or "eeg" not in obj or "concept_id" not in obj:
+                raise ValueError(f"Bad cache file: {path}")
+            self._lru.put(subject, obj)
+            return obj
+
+        obj2 = self._safe_load_cache_npy(paths)
+        # Store memmap + tensor dict; __getitem__ handles conversion to torch.
+        self._lru.put(subject, obj2)  # type: ignore[arg-type]
+        return obj2  # type: ignore[return-value]
 
     def _split_subjects(self) -> Tuple[Sequence[str], Sequence[str], Sequence[str]]:
         subs = list(self.subjects)
@@ -604,9 +633,14 @@ class Ds003825TripletDataset(Dataset):
 
             for sub in use:
                 self._ensure_subject_cached(sub)
-                obj = self._safe_load_cache(self._cache_path(sub))
-                n_epochs = int(obj["eeg"].shape[0])
-                concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
+                if self.cache_format == "pt":
+                    obj = self._safe_load_cache(self._cache_paths(sub)["pt"])
+                    n_epochs = int(obj["eeg"].shape[0])
+                    concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
+                else:
+                    obj = self._safe_load_cache_npy(self._cache_paths(sub))
+                    n_epochs = int(obj["eeg_mm"].shape[0])
+                    concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
                 for i in range(n_epochs):
                     cid = int(concept[i])
                     if 0 <= cid < int(self.all_text_vectors.shape[0]):
@@ -617,9 +651,14 @@ class Ds003825TripletDataset(Dataset):
         all_trials: List[_TrialRef] = []
         for sub in self.subjects:
             self._ensure_subject_cached(sub)
-            obj = self._safe_load_cache(self._cache_path(sub))
-            n_epochs = int(obj["eeg"].shape[0])
-            concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
+            if self.cache_format == "pt":
+                obj = self._safe_load_cache(self._cache_paths(sub)["pt"])
+                n_epochs = int(obj["eeg"].shape[0])
+                concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
+            else:
+                obj = self._safe_load_cache_npy(self._cache_paths(sub))
+                n_epochs = int(obj["eeg_mm"].shape[0])
+                concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
             for i in range(n_epochs):
                 cid = int(concept[i])
                 if 0 <= cid < int(self.all_text_vectors.shape[0]):
@@ -651,7 +690,11 @@ class Ds003825TripletDataset(Dataset):
         tr = self._trials[int(idx)]
         subj = tr.subject
         obj = self._load_subject(subj)
-        eeg = obj["eeg"][int(tr.epoch_index)]  # [C,T] float32
+        if self.cache_format == "pt":
+            eeg = obj["eeg"][int(tr.epoch_index)]  # [C,T] float32
+        else:
+            eeg_np = obj["eeg_mm"][int(tr.epoch_index)]  # numpy memmap slice [C,T]
+            eeg = torch.from_numpy(np.asarray(eeg_np, dtype=np.float32))
         concept = int(tr.concept_id)
         image_vec = self.all_image_vectors[concept]
         text_vec = self.all_text_vectors[concept]

@@ -575,8 +575,10 @@ class Ds003825TripletDataset(Dataset):
                 concept = tensors["concept_id"].numpy().astype(np.int16, copy=False)
                 eeg_path = paths["eeg"]
                 concept_path = paths["concept"]
-                eeg_tmp = f"{eeg_path}.tmp.{os.getpid()}"
-                concept_tmp = f"{concept_path}.tmp.{os.getpid()}"
+                # NOTE: numpy.save appends ".npy" if the filename doesn't end with it.
+                # Ensure our tmp file names end with ".npy" so os.replace can find them.
+                eeg_tmp = f"{eeg_path}.tmp.{os.getpid()}.npy"
+                concept_tmp = f"{concept_path}.tmp.{os.getpid()}.npy"
                 np.save(eeg_tmp, eeg)
                 np.save(concept_tmp, concept)
                 os.replace(eeg_tmp, eeg_path)

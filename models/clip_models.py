@@ -17,7 +17,9 @@ class SpatialMoEEncoder(nn.Module):
         # visual_indices,
         # semantic_indices,
         embedding_dim=512,
-        pretrained_path=None  # <-- 新增：预训练权重路径
+        pretrained_path=None,  # <-- 新增：预训练权重路径
+        router_mode: str = "moe",  # moe | semantic | fusion | uniform | visual
+        head_dropout: float = 0.5,
     ):
         super().__init__()
         
@@ -25,6 +27,8 @@ class SpatialMoEEncoder(nn.Module):
         self.n_samples = n_samples
         self.embedding_dim = embedding_dim
         self.backbone_in_chans = 128
+        self.router_mode = str(router_mode or "moe").strip().lower()
+        self.head_dropout = float(head_dropout)
 
         # Optional input adapter (e.g., paper ds003825 provides 64ch EEG):
         # Map (B, C, T) -> (B, 128, T) so the pretrained DreamDiffusion backbone
@@ -169,21 +173,21 @@ class SpatialMoEEncoder(nn.Module):
         self.expert_visual_head = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.GELU(),
-            nn.Dropout(0.5),
+            nn.Dropout(self.head_dropout),
             nn.Linear(self.backbone_dim, embedding_dim)
         )
         
         self.expert_semantic_head = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.GELU(),
-            nn.Dropout(0.5),
+            nn.Dropout(self.head_dropout),
             nn.Linear(self.backbone_dim, embedding_dim)
         )
         
         self.expert_fusion_head = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.GELU(),
-            nn.Dropout(0.5),
+            nn.Dropout(self.head_dropout),
             nn.Linear(self.backbone_dim, embedding_dim)
         )
 
@@ -224,6 +228,25 @@ class SpatialMoEEncoder(nn.Module):
         g_fus_img = gates[:, 1:2]
         g_sem_txt = gates[:, 2:3]
         g_fus_txt = gates[:, 3:4]
+
+        # Optional fixed router modes to reduce training noise / for ablations.
+        # This is useful when supervision is weak and the router can destabilize learning.
+        mode = self.router_mode
+        if mode in {"semantic", "semantic_only"}:
+            g_vis_img = torch.ones_like(g_vis_img)
+            g_fus_img = torch.zeros_like(g_fus_img)
+            g_sem_txt = torch.ones_like(g_sem_txt)
+            g_fus_txt = torch.zeros_like(g_fus_txt)
+        elif mode in {"fusion", "fusion_only"}:
+            g_vis_img = torch.zeros_like(g_vis_img)
+            g_fus_img = torch.ones_like(g_fus_img)
+            g_sem_txt = torch.zeros_like(g_sem_txt)
+            g_fus_txt = torch.ones_like(g_fus_txt)
+        elif mode in {"uniform"}:
+            g_vis_img = torch.full_like(g_vis_img, 0.5)
+            g_fus_img = torch.full_like(g_fus_img, 0.5)
+            g_sem_txt = torch.full_like(g_sem_txt, 0.5)
+            g_fus_txt = torch.full_like(g_fus_txt, 0.5)
 
         # # # 归一化权重
         # g_vis_img = g_vis_img / (g_vis_img + g_fus_img + 1e-6)

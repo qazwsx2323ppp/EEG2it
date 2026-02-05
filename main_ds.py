@@ -563,6 +563,8 @@ def main(cfg: DictConfig):
         n_samples=cfg.model.n_samples,
         embedding_dim=cfg.model.embedding_dim,
         pretrained_path=cfg.model.get("pretrained_path", None),
+        router_mode=cfg.model.get("router_mode", "moe"),
+        head_dropout=cfg.model.get("head_dropout", 0.5),
     ).to(device)
 
     if distributed:
@@ -667,6 +669,13 @@ def main(cfg: DictConfig):
     loss_params = (list(loss_fn_txt.parameters()) if loss_fn_img is None else (list(loss_fn_img.parameters()) + list(loss_fn_txt.parameters())))
 
     unfreeze_patch_embed = bool(cfg.training.get("unfreeze_patch_embed", False))
+    unfreeze_last_blocks = int(cfg.training.get("unfreeze_last_blocks", 2) or 0)
+    try:
+        backbone = model.module.backbone if distributed else model.backbone
+        depth = int(len(getattr(backbone, "blocks", []))) or 24
+    except Exception:
+        depth = 24
+    first_unfrozen = max(0, depth - max(0, unfreeze_last_blocks))
 
     named_params = model.named_parameters() if not distributed else model.module.named_parameters()
     for name, param in named_params:
@@ -675,7 +684,16 @@ def main(cfg: DictConfig):
                 params_backbone_active.append(param)
                 param.requires_grad = True
                 continue
-            if "blocks.23" in name or "blocks.22" in name or "norm." in name:
+            # Unfreeze last N transformer blocks + norms for finetuning.
+            blk_idx = None
+            try:
+                if "blocks." in name:
+                    # e.g. backbone.blocks.22.attn.qkv.weight
+                    blk_idx = int(name.split("blocks.", 1)[1].split(".", 1)[0])
+            except Exception:
+                blk_idx = None
+
+            if "norm." in name or (blk_idx is not None and blk_idx >= first_unfrozen):
                 params_backbone_active.append(param)
                 param.requires_grad = True
             else:

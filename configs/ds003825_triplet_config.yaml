@@ -102,8 +102,9 @@ training:
     enabled: true
     backend: "nccl"
     find_unused_parameters: true
-  # ds003825 uses 64ch input expanded to 128; letting patch_embed adapt helps a lot.
+  # Finetuning controls (ds003825 is a hard setting; consider increasing these for learnability tests)
   unfreeze_patch_embed: true
+  unfreeze_last_blocks: 2
   patience: 5
   # Top-1 是 [0,1] 的小数；min_delta 设太大会导致「Top-1 变好但不保存」
   min_delta: 0.0001

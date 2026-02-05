@@ -1,0 +1,31 @@
+# Strong overfit debug: if this still can't beat chance, the supervision/pipeline is the blocker.
+#
+# Use:
+#   torchrun --nproc_per_node=1 main_ds.py --config-name ds003825_overfit_sub01_strong
+
+defaults:
+  - ds003825_overfit_sub01
+  - _self_
+
+data:
+  # Use more trials for the same subject to test learnability.
+  trial_stride: 2
+  baseline_correction: true
+  zscore: false
+
+training:
+  # More trainable capacity
+  unfreeze_last_blocks: 8
+  unfreeze_patch_embed: true
+  epochs: 30
+  max_steps_per_epoch: 800
+  max_val_steps: 400
+  patience: 10
+  min_delta: 0.00002
+  learning_rate: 0.0002
+
+model:
+  # Remove router noise; focus on semantic head alignment first.
+  router_mode: "semantic"
+  head_dropout: 0.1
+

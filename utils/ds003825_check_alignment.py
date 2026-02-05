@@ -59,6 +59,19 @@ def main() -> int:
     events, event_id = mne.events_from_annotations(raw, verbose="ERROR")
     anno_samp = events[:, 0].astype(np.int64)
     anno_sec = (anno_samp - int(getattr(raw, "first_samp", 0))) / sfreq
+    # Prefer stimulus-onset markers (E  1) if present; this avoids "nearest event" matching to E2/E3.
+    e1_key = None
+    for k in event_id.keys():
+        if str(k).strip() in {"Event/E  1", "Event/E1", "E1"}:
+            e1_key = k
+            break
+    if e1_key is not None:
+        e1_code = int(event_id[e1_key])
+        e1_mask = events[:, 2] == e1_code
+        e1_samp = events[e1_mask][:, 0].astype(np.int64)
+        e1_sec = (e1_samp - int(getattr(raw, "first_samp", 0))) / sfreq
+    else:
+        e1_sec = anno_sec
 
     # Parse candidate timing columns from events.tsv.
     onset = np.asarray([_float(r.get("onset", "nan")) for r in rows], dtype=np.float64)
@@ -78,8 +91,12 @@ def main() -> int:
         candidates.append(("sample_ms_to_seconds", finite(sample / 1000.0)))
         candidates.append(("sample_samples_at_orig", finite(sample / sfreq)))
 
-    print(f"[align] subject={subject} raw_sfreq={sfreq} annotations={len(anno_sec)} events_rows={len(rows)}")
+    print(f"[align] subject={subject} raw_sfreq={sfreq} annotations={len(anno_sec)} E1={len(e1_sec)} events_rows={len(rows)}")
     print(f"[align] event_id_keys(sample)={list(event_id)[:10]}")
+    if e1_key is not None:
+        print(f"[align] using E1 key: {e1_key} -> code={event_id[e1_key]}")
+    else:
+        print("[align] E1 key not found; using all annotation events.")
 
     # Score each candidate by median/mean nearest diff to annotation times (seconds).
     for name, sec in candidates:
@@ -87,8 +104,15 @@ def main() -> int:
             continue
         # Only compare first chunk to keep it fast.
         sec2 = sec[: min(sec.size, 5000)]
-        med, mean = _nearest_abs_diff(sec2, anno_sec)
-        print(f"[align] {name}: finite={sec.size} nearest_diff_sec median={med:.4f} mean={mean:.4f}")
+        med, mean = _nearest_abs_diff(sec2, e1_sec)
+        print(f"[align] {name}: finite={sec.size} nearest_diff_sec_to_E1 median={med:.4f} mean={mean:.4f}")
+
+        # If E1 event count matches events.tsv rows, also check ordered alignment (i-th with i-th).
+        if e1_sec.size == sec2.size:
+            diff = sec2 - e1_sec[: sec2.size]
+            med2 = float(np.median(np.abs(diff)))
+            mean2 = float(np.mean(np.abs(diff)))
+            print(f"[align]   ordered_abs_diff_sec median={med2:.4f} mean={mean2:.4f}")
 
     # Print a few example rows from events.tsv (onset vs time_stimon) and nearest annotation.
     print("[align] examples (events.tsv -> nearest annotation):")
@@ -98,10 +122,10 @@ def main() -> int:
         ts = _float(r.get("time_stimon", "nan"))
         # choose whichever is finite for lookup
         look = ts if math.isfinite(ts) else (o / 1000.0 if o > 1000 else o)
-        # nearest annotation
-        if anno_sec.size:
-            j = int(np.argmin(np.abs(anno_sec - look)))
-            nearest = float(anno_sec[j])
+        # nearest E1 annotation
+        if e1_sec.size:
+            j = int(np.argmin(np.abs(e1_sec - look)))
+            nearest = float(e1_sec[j])
             delta = float(look - nearest)
         else:
             nearest, delta = float("nan"), float("nan")
@@ -112,4 +136,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

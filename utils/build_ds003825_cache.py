@@ -59,6 +59,7 @@ def main():
     args = ap.parse_args()
 
     cfg = None
+    repo_root = Path(__file__).resolve().parents[1]
     if args.config_name:
         cfg = _load_cfg_from_hydra(args.config_name)
 
@@ -72,10 +73,19 @@ def main():
             cur = cur[key]
         return cur
 
-    bids_root = args.bids_root or cfg_get("data.eeg_path", "")
-    text_vec = args.text_vec or cfg_get("data.text_vec_path", "")
-    image_vec = args.image_vec or cfg_get("data.image_vec_path", "") or text_vec
-    cache_dir = args.cache_dir or cfg_get("data.cache_dir", "")
+    # NOTE: Many project configs use `${hydra:runtime.cwd}` / `${data.root}` in paths.
+    # When composing Hydra configs programmatically (without @hydra.main), HydraConfig
+    # may not be set and resolving those interpolations can fail.
+    # For this utility we only need stable paths, so we derive them from:
+    #   1) explicit CLI args, else
+    #   2) environment variables, else
+    #   3) repo_root defaults.
+    bids_root = args.bids_root or os.environ.get("DS003825_ROOT") or str(repo_root / "data" / "ds003825")
+    text_vec = args.text_vec or str(repo_root / "data" / "ds003825_concept_text.npy")
+    image_vec = args.image_vec or str(repo_root / "data" / "ds003825_concept_image.npy")
+    if not os.path.exists(image_vec):
+        image_vec = text_vec
+    cache_dir = args.cache_dir or str(repo_root / "data" / "ds003825_cache_paper")
     cache_format = args.cache_format or cfg_get("data.cache_format", "npy")
     subjects = args.subjects or cfg_get("data.subjects", "")
     exclude_subjects = args.exclude_subjects or cfg_get("data.exclude_subjects", "")

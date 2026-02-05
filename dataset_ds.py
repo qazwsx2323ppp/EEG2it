@@ -320,18 +320,24 @@ def _preproc_and_epoch_subject(
         raise ValueError(mode)
 
     timing_candidates: List[Tuple[str, np.ndarray]] = []
-    # Prefer explicit experiment clock columns (often in seconds) when present.
+    # ds003825 (THINGS RSVP EEG) exports often store BIDS `onset` not in seconds, but in samples/ms.
+    # Our alignment checks against BrainVision E1 markers show `onset_ms_to_seconds` (or equivalently
+    # samples_at_orig at 1000Hz) matches E1 timestamps best, while `time_stimon` can be a separate
+    # experiment clock with a non-constant offset/drift.
+    #
+    # Therefore, we prefer `onset`-derived timing first, and keep `time_stimon` only as a fallback.
+    # onset column candidates
+    timing_candidates.append(("onset_ms_to_seconds", _sec_from(onset_arr, "ms_to_seconds")))
+    timing_candidates.append(("onset_samples_at_orig", _sec_from(onset_arr, "samples_at_orig")))
+    timing_candidates.append(("onset_as_seconds", _sec_from(onset_arr, "as_seconds")))
+    # sample column candidates
+    timing_candidates.append(("sample_ms_to_seconds", _sec_from(sample_arr, "ms_to_seconds")))
+    timing_candidates.append(("sample_samples_at_orig", _sec_from(sample_arr, "samples_at_orig")))
+    timing_candidates.append(("sample_as_seconds", _sec_from(sample_arr, "as_seconds")))
+    # Explicit experiment clock columns (often in seconds) as last resort.
     timing_candidates.append(("time_stimon_as_seconds", _sec_from(time_stimon_arr, "as_seconds")))
     timing_candidates.append(("time_stimon_ms_to_seconds", _sec_from(time_stimon_arr, "ms_to_seconds")))
     timing_candidates.append(("time_stimoff_as_seconds", _sec_from(time_stimoff_arr, "as_seconds")))
-    # onset column candidates
-    timing_candidates.append(("onset_as_seconds", _sec_from(onset_arr, "as_seconds")))
-    timing_candidates.append(("onset_ms_to_seconds", _sec_from(onset_arr, "ms_to_seconds")))
-    timing_candidates.append(("onset_samples_at_orig", _sec_from(onset_arr, "samples_at_orig")))
-    # sample column candidates
-    timing_candidates.append(("sample_as_seconds", _sec_from(sample_arr, "as_seconds")))
-    timing_candidates.append(("sample_ms_to_seconds", _sec_from(sample_arr, "ms_to_seconds")))
-    timing_candidates.append(("sample_samples_at_orig", _sec_from(sample_arr, "samples_at_orig")))
 
     # Tie-break preference order: earlier is better when keep counts match.
     pref = {name: i for i, (name, _) in enumerate(timing_candidates)}

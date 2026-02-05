@@ -98,7 +98,7 @@ def main() -> int:
     else:
         print("[align] E1 key not found; using all annotation events.")
 
-    # Score each candidate by median/mean nearest diff to annotation times (seconds).
+    # Score each candidate by median/mean nearest diff to E1 annotation times (seconds).
     for name, sec in candidates:
         if sec.size == 0:
             continue
@@ -107,8 +107,9 @@ def main() -> int:
         med, mean = _nearest_abs_diff(sec2, e1_sec)
         print(f"[align] {name}: finite={sec.size} nearest_diff_sec_to_E1 median={med:.4f} mean={mean:.4f}")
 
-        # If E1 event count matches events.tsv rows, also check ordered alignment (i-th with i-th).
-        if e1_sec.size == sec2.size:
+        # Also check ordered alignment (i-th with i-th) for the compared prefix.
+        # This is more stringent than nearest-event matching.
+        if e1_sec.size >= sec2.size and sec2.size > 0:
             diff = sec2 - e1_sec[: sec2.size]
             med2 = float(np.median(np.abs(diff)))
             mean2 = float(np.mean(np.abs(diff)))

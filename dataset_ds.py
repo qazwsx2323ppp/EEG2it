@@ -34,6 +34,7 @@ import csv
 import hashlib
 import os
 import random
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -458,26 +459,75 @@ class Ds003825TripletDataset(Dataset):
         fname = f"{subject}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.pt"
         return os.path.join(self.cache_dir, fname)
 
+    def _lock_path(self, subject: str) -> str:
+        return self._cache_path(subject) + ".lock"
+
+    def _acquire_lock(self, lock_path: str, timeout_s: float = 900.0, poll_s: float = 0.2) -> bool:
+        """
+        Cross-process lock using atomic create. Works for DDP ranks on the same filesystem.
+        """
+        start = time.time()
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.close(fd)
+                return True
+            except FileExistsError:
+                if (time.time() - start) > timeout_s:
+                    return False
+                time.sleep(poll_s)
+
+    def _release_lock(self, lock_path: str) -> None:
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
+
+    def _safe_load_cache(self, path: str) -> Dict[str, torch.Tensor]:
+        """
+        Load cache dict. If the cache is corrupted/partial (common under concurrent writes),
+        raise so caller can rebuild it.
+        """
+        return torch.load(path, map_location="cpu", weights_only=False)
+
     def _ensure_subject_cached(self, subject: str) -> None:
         path = self._cache_path(subject)
+        # Fast path
         if os.path.isfile(path):
             return
-        if _is_rank0():
-            print(f"[ds003825] caching {subject} -> {path}")
-        tensors = _preproc_and_epoch_subject(
-            self.bids_root,
-            subject,
-            baseline_correction=self.baseline_correction,
-            exclude_targets=self.exclude_targets,
-            l_freq=self.l_freq,
-            h_freq=self.h_freq,
-            resample_sfreq=self.resample_sfreq,
-            tmin=self.tmin,
-            tmax=self.tmax,
-            n_channels_out=self.n_channels_out,
-            verbose=False,
-        )
-        torch.save(tensors, path, _use_new_zipfile_serialization=True)
+
+        lock_path = self._lock_path(subject)
+        got = self._acquire_lock(lock_path)
+        if not got:
+            raise TimeoutError(f"Timed out waiting for cache lock: {lock_path}")
+
+        try:
+            # Another rank may have created it while we waited.
+            if os.path.isfile(path):
+                return
+
+            if _is_rank0():
+                print(f"[ds003825] caching {subject} -> {path}")
+
+            tensors = _preproc_and_epoch_subject(
+                self.bids_root,
+                subject,
+                baseline_correction=self.baseline_correction,
+                exclude_targets=self.exclude_targets,
+                l_freq=self.l_freq,
+                h_freq=self.h_freq,
+                resample_sfreq=self.resample_sfreq,
+                tmin=self.tmin,
+                tmax=self.tmax,
+                n_channels_out=self.n_channels_out,
+                verbose=False,
+            )
+
+            tmp = f"{path}.tmp.{os.getpid()}"
+            torch.save(tensors, tmp, _use_new_zipfile_serialization=True)
+            os.replace(tmp, path)  # atomic on POSIX
+        finally:
+            self._release_lock(lock_path)
 
     def _load_subject(self, subject: str) -> Dict[str, torch.Tensor]:
         cached = self._lru.get(subject)
@@ -485,10 +535,41 @@ class Ds003825TripletDataset(Dataset):
             return cached
         self._ensure_subject_cached(subject)
         path = self._cache_path(subject)
-        # PyTorch>=2.6 defaults torch.load(weights_only=True) for security, which can
-        # fail for cache files saved in legacy format. These cache files are produced
-        # locally by this script, so it is safe to load with weights_only=False.
-        obj = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            obj = self._safe_load_cache(path)
+        except Exception:
+            # Cache is likely corrupted/partial from a previous concurrent write. Rebuild it under a lock.
+            lock_path = self._lock_path(subject)
+            got = self._acquire_lock(lock_path)
+            if not got:
+                raise
+            try:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+                if _is_rank0():
+                    print(f"[ds003825] rebuilt corrupted cache: {path}")
+                tensors = _preproc_and_epoch_subject(
+                    self.bids_root,
+                    subject,
+                    baseline_correction=self.baseline_correction,
+                    exclude_targets=self.exclude_targets,
+                    l_freq=self.l_freq,
+                    h_freq=self.h_freq,
+                    resample_sfreq=self.resample_sfreq,
+                    tmin=self.tmin,
+                    tmax=self.tmax,
+                    n_channels_out=self.n_channels_out,
+                    verbose=False,
+                )
+                tmp = f"{path}.tmp.{os.getpid()}"
+                torch.save(tensors, tmp, _use_new_zipfile_serialization=True)
+                os.replace(tmp, path)
+            finally:
+                self._release_lock(lock_path)
+            obj = self._safe_load_cache(path)
         if not isinstance(obj, dict) or "eeg" not in obj or "concept_id" not in obj:
             raise ValueError(f"Bad cache file: {path}")
         self._lru.put(subject, obj)
@@ -523,7 +604,7 @@ class Ds003825TripletDataset(Dataset):
 
             for sub in use:
                 self._ensure_subject_cached(sub)
-                obj = torch.load(self._cache_path(sub), map_location="cpu", weights_only=False)
+                obj = self._safe_load_cache(self._cache_path(sub))
                 n_epochs = int(obj["eeg"].shape[0])
                 concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
                 for i in range(n_epochs):
@@ -536,7 +617,7 @@ class Ds003825TripletDataset(Dataset):
         all_trials: List[_TrialRef] = []
         for sub in self.subjects:
             self._ensure_subject_cached(sub)
-            obj = torch.load(self._cache_path(sub), map_location="cpu", weights_only=False)
+            obj = self._safe_load_cache(self._cache_path(sub))
             n_epochs = int(obj["eeg"].shape[0])
             concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
             for i in range(n_epochs):

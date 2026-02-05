@@ -211,6 +211,7 @@ def _preproc_and_epoch_subject(
     tmax: float,
     n_channels_epoch: int,
     n_channels_out: int,
+    channel_expand_mode: str,
     n_samples_out: int,
     interp_chunk: int,
     verbose: bool,
@@ -428,8 +429,13 @@ def _preproc_and_epoch_subject(
 
     c2 = int(data.shape[1])
     if c2 < n_channels_out:
-        pad = np.zeros((n, n_channels_out - c2, t), dtype=np.float32)
-        data = np.concatenate([data, pad], axis=1)
+        mode = str(channel_expand_mode or "zero").strip().lower()
+        if mode in {"repeat", "tile"} and c2 > 0:
+            reps = int((n_channels_out + c2 - 1) // c2)
+            data = np.tile(data, (1, reps, 1))[:, :n_channels_out, :].astype(np.float32, copy=False)
+        else:
+            pad = np.zeros((n, n_channels_out - c2, t), dtype=np.float32)
+            data = np.concatenate([data, pad], axis=1)
     elif c2 > n_channels_out:
         data = data[:, :n_channels_out, :]
 
@@ -496,6 +502,7 @@ class Ds003825TripletDataset(Dataset):
         self.tmax = float(_safe_get(cfg_data, "tmax", 1.0))
         self.n_channels_epoch = int(_safe_get(cfg_data, "n_channels_epoch", 64))
         self.n_channels_out = int(_safe_get(cfg_data, "n_channels_out", 128))
+        self.channel_expand_mode = str(_safe_get(cfg_data, "channel_expand_mode", "zero")).strip().lower()
         self.n_samples_out = int(_safe_get(cfg_data, "n_samples_out", 512))
         self.interp_chunk = int(_safe_get(cfg_data, "interp_chunk", 256))
 
@@ -546,18 +553,20 @@ class Ds003825TripletDataset(Dataset):
     def _cache_path(self, subject: str) -> str:
         ext = "pt" if self.cache_format == "pt" else "npy"
         ch_tag = f"ch{int(self.n_channels_epoch)}to{int(self.n_channels_out)}"
+        ce_tag = f"ce{self.channel_expand_mode or 'zero'}"
         samp_tag = f"s{int(self.n_samples_out)}"
         fname = (
-            f"{subject}_{ch_tag}_{samp_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
+            f"{subject}_{ch_tag}_{ce_tag}_{samp_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
             f"_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.{ext}"
         )
         return os.path.join(self.cache_dir, fname)
 
     def _cache_paths(self, subject: str) -> Dict[str, str]:
         ch_tag = f"ch{int(self.n_channels_epoch)}to{int(self.n_channels_out)}"
+        ce_tag = f"ce{self.channel_expand_mode or 'zero'}"
         samp_tag = f"s{int(self.n_samples_out)}"
         base = (
-            f"{subject}_{ch_tag}_{samp_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
+            f"{subject}_{ch_tag}_{ce_tag}_{samp_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
             f"_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}"
         )
         if self.cache_format == "pt":
@@ -649,6 +658,7 @@ class Ds003825TripletDataset(Dataset):
                 tmax=self.tmax,
                 n_channels_epoch=self.n_channels_epoch,
                 n_channels_out=self.n_channels_out,
+                channel_expand_mode=self.channel_expand_mode,
                 n_samples_out=self.n_samples_out,
                 interp_chunk=self.interp_chunk,
                 verbose=False,

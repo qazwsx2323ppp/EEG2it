@@ -37,6 +37,10 @@ data:
   # We keep 64 real channels and zero-pad to 128 for the model.
   n_channels_epoch: 64
   n_channels_out: 128
+  # How to expand from 64->128 for the frozen/pretrained backbone:
+  # - "zero": pad zeros (50% channels near_zero, often hurts)
+  # - "repeat": tile channels to fill 128 (usually better for quick sanity)
+  channel_expand_mode: "repeat"
   baseline_correction: false
   exclude_targets: true
   split_by: "subject"     # subject | trial
@@ -98,6 +102,8 @@ training:
     enabled: true
     backend: "nccl"
     find_unused_parameters: true
+  # ds003825 uses 64ch input expanded to 128; letting patch_embed adapt helps a lot.
+  unfreeze_patch_embed: true
   patience: 5
   # Top-1 是 [0,1] 的小数；min_delta 设太大会导致「Top-1 变好但不保存」
   min_delta: 0.0001

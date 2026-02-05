@@ -666,9 +666,15 @@ def main(cfg: DictConfig):
     params_head = []
     loss_params = (list(loss_fn_txt.parameters()) if loss_fn_img is None else (list(loss_fn_img.parameters()) + list(loss_fn_txt.parameters())))
 
+    unfreeze_patch_embed = bool(cfg.training.get("unfreeze_patch_embed", False))
+
     named_params = model.named_parameters() if not distributed else model.module.named_parameters()
     for name, param in named_params:
         if "backbone" in name:
+            if unfreeze_patch_embed and ("patch_embed" in name or "pos_embed" in name):
+                params_backbone_active.append(param)
+                param.requires_grad = True
+                continue
             if "blocks.23" in name or "blocks.22" in name or "norm." in name:
                 params_backbone_active.append(param)
                 param.requires_grad = True

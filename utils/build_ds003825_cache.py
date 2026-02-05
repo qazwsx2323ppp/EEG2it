@@ -54,6 +54,12 @@ def main():
     ap.add_argument("--tmax", type=float, default=None)
     ap.add_argument("--n-channels-epoch", type=int, default=None, help="Real EEG channels after picks (paper uses 64).")
     ap.add_argument("--n-channels-out", type=int, default=None, help="Channels fed to model (DreamDiffusion expects 128).")
+    ap.add_argument(
+        "--channel-expand-mode",
+        type=str,
+        default="",
+        help="How to expand from n_channels_epoch to n_channels_out: 'zero' (pad zeros) or 'repeat' (tile channels).",
+    )
     ap.add_argument("--n-samples-out", type=int, default=None, help="Samples fed to model (DreamDiffusion expects 512).")
     ap.add_argument("--interp-chunk", type=int, default=None, help="Chunk size (epochs) for time interpolation.")
     args = ap.parse_args()
@@ -113,6 +119,7 @@ def main():
     tmax = float(args.tmax if args.tmax is not None else cfg_get("data.tmax", 1.0))
     n_channels_epoch = int(args.n_channels_epoch if args.n_channels_epoch is not None else cfg_get("data.n_channels_epoch", 64))
     n_channels_out = int(args.n_channels_out if args.n_channels_out is not None else cfg_get("data.n_channels_out", 128))
+    channel_expand_mode = str(args.channel_expand_mode or cfg_get("data.channel_expand_mode", "zero")).strip().lower()
     n_samples_out = int(args.n_samples_out if args.n_samples_out is not None else cfg_get("data.n_samples_out", 512))
     interp_chunk = int(args.interp_chunk if args.interp_chunk is not None else cfg_get("data.interp_chunk", 256))
 
@@ -146,6 +153,7 @@ def main():
         "tmax": float(tmax),
         "n_channels_epoch": int(n_channels_epoch),
         "n_channels_out": int(n_channels_out),
+        "channel_expand_mode": channel_expand_mode,
         "n_samples_out": int(n_samples_out),
         "interp_chunk": int(interp_chunk),
         # Build cache only; splits don't matter here.

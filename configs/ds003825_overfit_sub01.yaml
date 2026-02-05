@@ -16,6 +16,7 @@ data:
   trial_split: [0.9, 0.1, 0.0]
   # Use more data; keep it still manageable.
   trial_stride: 5
+  channel_expand_mode: "repeat"
 
 training:
   distributed:
@@ -28,4 +29,4 @@ training:
   max_val_steps: 200
   patience: 8
   min_delta: 0.00005
-
+  unfreeze_patch_embed: true

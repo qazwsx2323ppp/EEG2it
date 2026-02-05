@@ -24,6 +24,7 @@ data:
   # Keep model input compatible with DreamDiffusion backbone.
   n_channels_epoch: 64
   n_channels_out: 128
+  channel_expand_mode: "repeat"
   n_samples_out: 512
   interp_chunk: 128
 
@@ -41,4 +42,4 @@ training:
 
   distributed:
     enabled: false
-
+  unfreeze_patch_embed: true

@@ -614,8 +614,15 @@ class Ds003825TripletDataset(Dataset):
 
         p_train, p_val, p_test = self.subject_split
         n = len(subs)
-        n_test = max(1, int(round(n * float(p_test))))
-        n_val = max(1, int(round(n * float(p_val))))
+        # Allow zero-sized splits when user sets p_val/p_test to 0.0 (useful for quick sanity runs).
+        n_test = int(round(n * float(p_test))) if float(p_test) > 0.0 else 0
+        n_val = int(round(n * float(p_val))) if float(p_val) > 0.0 else 0
+        # Ensure at least 1 train subject if possible by trimming val/test first.
+        if (n - n_test - n_val) <= 0 and n > 0:
+            if n_val > 0:
+                n_val = max(0, n_val - 1)
+            if (n - n_test - n_val) <= 0 and n_test > 0:
+                n_test = max(0, n_test - 1)
         test = subs[:n_test]
         val = subs[n_test : n_test + n_val]
         train = subs[n_test + n_val :]
@@ -670,8 +677,13 @@ class Ds003825TripletDataset(Dataset):
         rng.shuffle(all_trials)
         p_train, p_val, p_test = self.trial_split
         n = len(all_trials)
-        n_test = max(1, int(round(n * float(p_test))))
-        n_val = max(1, int(round(n * float(p_val))))
+        n_test = int(round(n * float(p_test))) if float(p_test) > 0.0 else 0
+        n_val = int(round(n * float(p_val))) if float(p_val) > 0.0 else 0
+        if (n - n_test - n_val) <= 0 and n > 0:
+            if n_val > 0:
+                n_val = max(0, n_val - 1)
+            if (n - n_test - n_val) <= 0 and n_test > 0:
+                n_test = max(0, n_test - 1)
         test = all_trials[:n_test]
         val = all_trials[n_test : n_test + n_val]
         train = all_trials[n_test + n_val :]

@@ -9,6 +9,8 @@ data:
   # Limit subjects to speed up caching + make early feedback fast.
   subjects: "sub-01,sub-02"
   exclude_subjects: ""
+  # With only 2 subjects, ensure train/val are non-empty.
+  subject_split: [0.5, 0.5, 0.0]
 
 training:
   epochs: 10
@@ -23,4 +25,3 @@ training:
 
   distributed:
     enabled: false
-

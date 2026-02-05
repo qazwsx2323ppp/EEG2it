@@ -244,7 +244,8 @@ def _preproc_and_epoch_subject(
     # (Rule 2 & 6) Build stimulus-onset events from events table.
     rows = _read_events_table(events_path)
     concept_ids: List[int] = []
-    event_samples: List[int] = []
+    onset_vals: List[float] = []
+    sample_vals: List[float] = []
 
     sfreq = float(raw.info["sfreq"])
     first_samp = int(getattr(raw, "first_samp", 0))
@@ -252,7 +253,6 @@ def _preproc_and_epoch_subject(
     tmin_samp = int(round(tmin * sfreq))
     tmax_samp = int(round(tmax * sfreq))
 
-    dropped_oob = 0
     dropped_parse = 0
     for r in rows:
         concept = _int_or_none(r.get("objectnumber"))
@@ -262,47 +262,90 @@ def _preproc_and_epoch_subject(
             is_target = _int_or_none(r.get("istarget"))
             if is_target is not None and is_target != 0:
                 continue
-        onset_sec = _float_or_none(r.get("onset"))
-        sample_col = _int_or_none(r.get("sample"))
-
-        # Prefer onset (seconds). If onset is missing or inconsistent, fall back to sample column:
-        # sample is often provided in original sampling-rate samples -> seconds = sample / orig_sfreq.
-        onset_candidates: List[float] = []
-        if onset_sec is not None:
-            onset_candidates.append(float(onset_sec))
-        if sample_col is not None and orig_sfreq > 0:
-            onset_candidates.append(float(sample_col) / float(orig_sfreq))
-
-        if not onset_candidates:
+        onset_raw = _float_or_none(r.get("onset"))
+        sample_raw = _float_or_none(r.get("sample"))
+        if onset_raw is None and sample_raw is None:
             dropped_parse += 1
             continue
 
-        samp_abs: Optional[int] = None
-        for on in onset_candidates:
-            try:
-                # time_as_index returns 0-based index relative to raw.first_samp; Epochs expects absolute samples.
-                idx0 = int(raw.time_as_index(on, use_rounding=True)[0])
-                cand = first_samp + idx0
-            except Exception:
-                continue
-            # Bound check for epoch window
-            if (cand + tmin_samp) >= first_samp and (cand + tmax_samp) < n_samp_total:
-                samp_abs = cand
-                break
-
-        if samp_abs is None:
-            dropped_oob += 1
-            continue
-
         concept_ids.append(int(concept))
-        event_samples.append(int(samp_abs))
+        onset_vals.append(float(onset_raw) if onset_raw is not None else float("nan"))
+        sample_vals.append(float(sample_raw) if sample_raw is not None else float("nan"))
 
-    if len(event_samples) == 0:
+    if len(concept_ids) == 0:
         raise ValueError(
             f"No usable stimulus onset events for {subject} from {events_path} "
-            f"(rows={len(rows)}, kept=0, dropped_parse={dropped_parse}, dropped_oob={dropped_oob}, "
+            f"(rows={len(rows)}, kept=0, dropped_parse={dropped_parse}, dropped_oob=0, "
             f"orig_sfreq={orig_sfreq}, sfreq={sfreq}, first_samp={first_samp}, n_times={int(raw.n_times)})."
         )
+
+    # Choose the best timing interpretation per subject.
+    onset_arr = np.asarray(onset_vals, dtype=np.float64)
+    sample_arr = np.asarray(sample_vals, dtype=np.float64)
+
+    def _sec_from(arr: np.ndarray, mode: str) -> np.ndarray:
+        if mode == "as_seconds":
+            return arr
+        if mode == "ms_to_seconds":
+            return arr / 1000.0
+        if mode == "samples_at_orig":
+            return arr / float(orig_sfreq)
+        if mode == "samples_at_orig_ms":
+            # sometimes stored as ms@1000Hz samples but already integer; interpret as ms
+            return (arr / float(orig_sfreq)) / 1000.0
+        raise ValueError(mode)
+
+    timing_candidates: List[Tuple[str, np.ndarray]] = []
+    # onset column candidates
+    timing_candidates.append(("onset_as_seconds", _sec_from(onset_arr, "as_seconds")))
+    timing_candidates.append(("onset_ms_to_seconds", _sec_from(onset_arr, "ms_to_seconds")))
+    timing_candidates.append(("onset_samples_at_orig", _sec_from(onset_arr, "samples_at_orig")))
+    # sample column candidates
+    timing_candidates.append(("sample_as_seconds", _sec_from(sample_arr, "as_seconds")))
+    timing_candidates.append(("sample_ms_to_seconds", _sec_from(sample_arr, "ms_to_seconds")))
+    timing_candidates.append(("sample_samples_at_orig", _sec_from(sample_arr, "samples_at_orig")))
+
+    best_name = ""
+    best_keep = 0
+    best_samples_abs: Optional[np.ndarray] = None
+    dropped_oob = 0
+    for name, sec in timing_candidates:
+        if not np.isfinite(sec).any():
+            continue
+        sec2 = np.where(np.isfinite(sec), sec, -1.0)
+        try:
+            idx0 = raw.time_as_index(sec2, use_rounding=True)
+        except Exception:
+            continue
+        idx0 = np.asarray(idx0, dtype=np.int64)
+        cand_abs = first_samp + idx0
+        ok = (sec2 >= 0.0) & ((cand_abs + tmin_samp) >= first_samp) & ((cand_abs + tmax_samp) < n_samp_total)
+        keep = int(ok.sum())
+        if keep > best_keep:
+            best_keep = keep
+            best_name = name
+            best_samples_abs = cand_abs[ok]
+            dropped_oob = int((~ok).sum())
+
+    if best_samples_abs is None or best_keep <= 0:
+        raise ValueError(
+            f"No usable stimulus onset events for {subject} from {events_path} "
+            f"(rows={len(rows)}, kept=0, dropped_parse={dropped_parse}, dropped_oob={len(concept_ids)}, "
+            f"orig_sfreq={orig_sfreq}, sfreq={sfreq}, first_samp={first_samp}, n_times={int(raw.n_times)})."
+        )
+
+    # Align concept ids to kept indices by recomputing ok mask for best.
+    sec_best = dict(timing_candidates)[best_name]
+    sec_best = np.where(np.isfinite(sec_best), sec_best, -1.0)
+    idx0_best = np.asarray(raw.time_as_index(sec_best, use_rounding=True), dtype=np.int64)
+    cand_abs_best = first_samp + idx0_best
+    ok_best = (sec_best >= 0.0) & ((cand_abs_best + tmin_samp) >= first_samp) & ((cand_abs_best + tmax_samp) < n_samp_total)
+    concept_kept = np.asarray(concept_ids, dtype=np.int32)[ok_best]
+    event_samples = cand_abs_best[ok_best].astype(np.int64, copy=False).tolist()
+    concept_ids = concept_kept.tolist()
+
+    if verbose and _is_rank0():
+        print(f"[ds003825] {subject}: timing={best_name} kept={best_keep}/{len(ok_best)} dropped_oob={dropped_oob}")
 
     events = np.zeros((len(event_samples), 3), dtype=np.int64)
     events[:, 0] = np.asarray(event_samples, dtype=np.int64)

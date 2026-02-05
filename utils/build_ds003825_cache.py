@@ -22,6 +22,8 @@ def main():
     ap.add_argument("--tmax", type=float, default=1.0)
     ap.add_argument("--n-channels-epoch", type=int, default=64, help="Real EEG channels after picks (paper uses 64).")
     ap.add_argument("--n-channels-out", type=int, default=128, help="Channels fed to model (DreamDiffusion expects 128).")
+    ap.add_argument("--n-samples-out", type=int, default=512, help="Samples fed to model (DreamDiffusion expects 512).")
+    ap.add_argument("--interp-chunk", type=int, default=256, help="Chunk size (epochs) for time interpolation.")
     args = ap.parse_args()
 
     os.makedirs(args.cache_dir, exist_ok=True)
@@ -46,6 +48,8 @@ def main():
         "tmax": float(args.tmax),
         "n_channels_epoch": int(args.n_channels_epoch),
         "n_channels_out": int(args.n_channels_out),
+        "n_samples_out": int(args.n_samples_out),
+        "interp_chunk": int(args.interp_chunk),
         # Build cache only; splits don't matter here.
         "split_by": "subject",
         "subject_split": [1.0, 0.0, 0.0],

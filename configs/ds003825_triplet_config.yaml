@@ -30,6 +30,9 @@ data:
   resample_sfreq: 250.0
   tmin: -0.1
   tmax: 1.0
+  # Model expects fixed-length input (DreamDiffusion typically 512 samples -> 128 tokens)
+  n_samples_out: 512
+  interp_chunk: 256
   # Paper uses 64 EEG channels, while the current DreamDiffusion backbone expects 128 input channels.
   # We keep 64 real channels and zero-pad to 128 for the model.
   n_channels_epoch: 64

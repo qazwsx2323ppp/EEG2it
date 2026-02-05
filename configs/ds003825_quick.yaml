@@ -13,6 +13,8 @@ data:
   subject_split: [0.5, 0.5, 0.0]
   n_channels_epoch: 64
   n_channels_out: 128
+  n_samples_out: 512
+  interp_chunk: 128
 
 training:
   epochs: 10

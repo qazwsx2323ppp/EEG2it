@@ -42,6 +42,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 
 
 def _is_rank0() -> bool:
@@ -203,6 +204,8 @@ def _preproc_and_epoch_subject(
     tmax: float,
     n_channels_epoch: int,
     n_channels_out: int,
+    n_samples_out: int,
+    interp_chunk: int,
     verbose: bool,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -398,8 +401,24 @@ def _preproc_and_epoch_subject(
     elif c2 > n_channels_out:
         data = data[:, :n_channels_out, :]
 
+    # Model compatibility: DreamDiffusion backbone expects a fixed n_samples (typically 512 -> 128 tokens).
+    # Paper epoch at 250Hz yields ~276 samples; interpolate to n_samples_out for training.
+    n_samples_out = int(n_samples_out)
+    if n_samples_out > 0 and int(data.shape[-1]) != n_samples_out:
+        src_len = int(data.shape[-1])
+        chunk = int(interp_chunk) if int(interp_chunk) > 0 else 256
+        out = np.empty((int(data.shape[0]), int(data.shape[1]), n_samples_out), dtype=np.float32)
+        for s in range(0, int(data.shape[0]), chunk):
+            e = min(int(data.shape[0]), s + chunk)
+            x = torch.from_numpy(data[s:e]).float()  # [B,C,L]
+            y = F.interpolate(x, size=n_samples_out, mode="linear", align_corners=False)
+            out[s:e] = y.cpu().numpy().astype(np.float32, copy=False)
+        data = out
+        t = n_samples_out
+
     if verbose and _is_rank0():
-        print(f"[ds003825] {subject}: epochs={data.shape[0]} shape={tuple(data.shape)} sfreq={epochs.info['sfreq']}")
+        extra = f" (interp {src_len}->{t})" if 'src_len' in locals() else ""
+        print(f"[ds003825] {subject}: epochs={data.shape[0]} shape={tuple(data.shape)} sfreq={epochs.info['sfreq']}{extra}")
 
     return {
         "eeg": torch.from_numpy(data),  # float32 [N,C,T]
@@ -439,6 +458,8 @@ class Ds003825TripletDataset(Dataset):
         self.tmax = float(_safe_get(cfg_data, "tmax", 1.0))
         self.n_channels_epoch = int(_safe_get(cfg_data, "n_channels_epoch", 64))
         self.n_channels_out = int(_safe_get(cfg_data, "n_channels_out", 128))
+        self.n_samples_out = int(_safe_get(cfg_data, "n_samples_out", 512))
+        self.interp_chunk = int(_safe_get(cfg_data, "interp_chunk", 256))
 
         # Cache
         cache_dir = _safe_get(cfg_data, "cache_dir", None)
@@ -483,16 +504,18 @@ class Ds003825TripletDataset(Dataset):
     def _cache_path(self, subject: str) -> str:
         ext = "pt" if self.cache_format == "pt" else "npy"
         ch_tag = f"ch{int(self.n_channels_epoch)}to{int(self.n_channels_out)}"
+        samp_tag = f"s{int(self.n_samples_out)}"
         fname = (
-            f"{subject}_{ch_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
+            f"{subject}_{ch_tag}_{samp_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
             f"_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}.{ext}"
         )
         return os.path.join(self.cache_dir, fname)
 
     def _cache_paths(self, subject: str) -> Dict[str, str]:
         ch_tag = f"ch{int(self.n_channels_epoch)}to{int(self.n_channels_out)}"
+        samp_tag = f"s{int(self.n_samples_out)}"
         base = (
-            f"{subject}_{ch_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
+            f"{subject}_{ch_tag}_{samp_tag}_hp{self.l_freq}_lp{self.h_freq}_rs{self.resample_sfreq}"
             f"_t{self.tmin}_{self.tmax}_bl{int(self.baseline_correction)}_exT{int(self.exclude_targets)}"
         )
         if self.cache_format == "pt":
@@ -584,6 +607,8 @@ class Ds003825TripletDataset(Dataset):
                 tmax=self.tmax,
                 n_channels_epoch=self.n_channels_epoch,
                 n_channels_out=self.n_channels_out,
+                n_samples_out=self.n_samples_out,
+                interp_chunk=self.interp_chunk,
                 verbose=False,
             )
 

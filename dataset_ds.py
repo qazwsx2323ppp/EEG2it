@@ -45,6 +45,13 @@ from torch.utils.data import Dataset
 import torch.nn.functional as F
 
 
+def _zscore_channelwise(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # x: [C, T]
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True, unbiased=False)
+    return (x - mean) / (std + float(eps))
+
+
 def _is_rank0() -> bool:
     try:
         return int(os.environ.get("RANK", "0")) == 0
@@ -434,6 +441,9 @@ class Ds003825TripletDataset(Dataset):
 
     def __init__(self, cfg_data: Any, mode: str = "train", split_index: int = 0):
         self.mode = str(mode)
+        # Enable unique-concept batch sampling in main_ds.py (compatible with utils/batch_samplers.py).
+        # We expose the same `backend` string the sampler checks for.
+        self.backend = "ds003825"
         self.bids_root = str(_safe_get(cfg_data, "eeg_path", ""))
         if not _is_bids_root(self.bids_root):
             raise ValueError(f"eeg_path must be a BIDS root (missing dataset_description.json): {self.bids_root}")
@@ -441,6 +451,9 @@ class Ds003825TripletDataset(Dataset):
         self.exclude_targets = bool(_safe_get(cfg_data, "exclude_targets", True))
         self.baseline_correction = bool(_safe_get(cfg_data, "baseline_correction", False))
         self.return_concept_id = bool(_safe_get(cfg_data, "return_concept_id", False))
+        self.zscore = bool(_safe_get(cfg_data, "zscore", False))
+        self.zscore_eps = float(_safe_get(cfg_data, "zscore_eps", 1e-6))
+        self.trial_stride = int(_safe_get(cfg_data, "trial_stride", 1))
 
         # Vectors
         text_vec_path = str(_safe_get(cfg_data, "text_vec_path", ""))
@@ -497,6 +510,10 @@ class Ds003825TripletDataset(Dataset):
         # Build index of trials (lazy load subject caches when needed)
         self._trials: List[_TrialRef] = []
         self._build_index()
+
+        # Expose concept ids for unique-concept sampler compatibility.
+        self.indices = np.arange(len(self._trials), dtype=np.int64)
+        self.ds_concept_ids = np.asarray([t.concept_id for t in self._trials], dtype=np.int32)
 
         if _is_rank0():
             print(f"[ds003825] mode={self.mode} trials={len(self._trials)} cache_dir={self.cache_dir}")
@@ -676,6 +693,7 @@ class Ds003825TripletDataset(Dataset):
         return train, val, test
 
     def _build_index(self) -> None:
+        stride = max(1, int(self.trial_stride))
         if self.split_by == "subject":
             train_subs, val_subs, test_subs = self._split_subjects()
             if self.mode == "train":
@@ -698,6 +716,8 @@ class Ds003825TripletDataset(Dataset):
                     n_epochs = int(obj["eeg_mm"].shape[0])
                     concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
                 for i in range(n_epochs):
+                    if stride > 1 and (i % stride) != 0:
+                        continue
                     cid = int(concept[i])
                     if 0 <= cid < int(self.all_text_vectors.shape[0]):
                         self._trials.append(_TrialRef(subject=sub, epoch_index=i, concept_id=cid))
@@ -716,6 +736,8 @@ class Ds003825TripletDataset(Dataset):
                 n_epochs = int(obj["eeg_mm"].shape[0])
                 concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
             for i in range(n_epochs):
+                if stride > 1 and (i % stride) != 0:
+                    continue
                 cid = int(concept[i])
                 if 0 <= cid < int(self.all_text_vectors.shape[0]):
                     all_trials.append(_TrialRef(subject=sub, epoch_index=i, concept_id=cid))
@@ -756,6 +778,9 @@ class Ds003825TripletDataset(Dataset):
         else:
             eeg_np = obj["eeg_mm"][int(tr.epoch_index)]  # numpy memmap slice [C,T]
             eeg = torch.from_numpy(np.asarray(eeg_np, dtype=np.float32))
+
+        if self.zscore:
+            eeg = _zscore_channelwise(eeg, eps=float(self.zscore_eps))
         concept = int(tr.concept_id)
         image_vec = self.all_image_vectors[concept]
         text_vec = self.all_text_vectors[concept]

@@ -221,7 +221,7 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", disable=rank != 0)):
         if _dist_any_stop(device):
             raise KeyboardInterrupt()
-        eeg_signals, image_vecs, text_vecs, _ = _to_device(batch, device)
+        eeg_signals, image_vecs, text_vecs, concept_ids = _to_device(batch, device)
 
         with autocast_ctx:
             outputs = model(eeg_signals)
@@ -248,7 +248,29 @@ def train_one_epoch(
                 uniq_img = torch.unique(image_vecs, dim=0).shape[0]
                 uniq_txt = torch.unique(text_vecs, dim=0).shape[0]
                 bsz = int(image_vecs.shape[0])
-                print(f"[sanity] cos(image_vec, text_vec) mean={cos:.4f} | unique image targets={uniq_img}/{bsz} | unique text targets={uniq_txt}/{bsz}")
+                msg = f"[sanity] cos(image_vec, text_vec) mean={cos:.4f} | unique image targets={uniq_img}/{bsz} | unique text targets={uniq_txt}/{bsz}"
+                if concept_ids is not None:
+                    uniq_c = int(torch.unique(concept_ids).numel())
+                    msg += f" | unique concept_ids={uniq_c}/{bsz}"
+                print(msg)
+
+                # EEG scale checks: if values are near-constant or extremely small, training can stall near ln(batch).
+                eeg_mean = float(eeg_signals.mean().item())
+                eeg_std = float(eeg_signals.std(unbiased=False).item())
+                eeg_min = float(eeg_signals.min().item())
+                eeg_max = float(eeg_signals.max().item())
+                zero_frac = float((eeg_signals.abs() < 1e-12).float().mean().item())
+                print(
+                    f"[sanity] eeg mean={eeg_mean:.3e} std={eeg_std:.3e} min={eeg_min:.3e} max={eeg_max:.3e} | near_zero={zero_frac*100:.2f}%"
+                )
+
+                # Embedding scale checks: norms should be reasonable and logits should have diagonal > off-diagonal.
+                txt_norm = float(text_vecs.norm(dim=-1).mean().item())
+                eeg_norm = float(eeg_text_embeddings.norm(dim=-1).mean().item())
+                logits = eeg_text_embeddings @ text_vecs.T
+                diag = float(torch.diag(logits).mean().item())
+                off = float((logits.sum() - torch.diag(logits).sum()).div(max(1, logits.numel() - logits.shape[0])).item())
+                print(f"[sanity] norms: eeg_text={eeg_norm:.3f} text={txt_norm:.3f} | logits diag={diag:.3f} off={off:.3f}")
             did_sanity = True
             if sanity_check_once:
                 sanity_check = False

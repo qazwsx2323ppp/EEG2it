@@ -232,6 +232,8 @@ def _preproc_and_epoch_subject(
     else:
         raw.load_data()
 
+    orig_sfreq = float(raw.info["sfreq"])
+
     # (Rule 3) FIR(Hamming) bandpass 0.1–100Hz.
     raw.filter(l_freq=l_freq, h_freq=h_freq, method="fir", fir_window="hamming", phase="zero", verbose="ERROR")
     # (Rule 3) Average reference.
@@ -244,6 +246,14 @@ def _preproc_and_epoch_subject(
     concept_ids: List[int] = []
     event_samples: List[int] = []
 
+    sfreq = float(raw.info["sfreq"])
+    first_samp = int(getattr(raw, "first_samp", 0))
+    n_samp_total = first_samp + int(raw.n_times)
+    tmin_samp = int(round(tmin * sfreq))
+    tmax_samp = int(round(tmax * sfreq))
+
+    dropped_oob = 0
+    dropped_parse = 0
     for r in rows:
         concept = _int_or_none(r.get("objectnumber"))
         if concept is None or concept < 0:
@@ -253,19 +263,46 @@ def _preproc_and_epoch_subject(
             if is_target is not None and is_target != 0:
                 continue
         onset_sec = _float_or_none(r.get("onset"))
-        if onset_sec is None:
+        sample_col = _int_or_none(r.get("sample"))
+
+        # Prefer onset (seconds). If onset is missing or inconsistent, fall back to sample column:
+        # sample is often provided in original sampling-rate samples -> seconds = sample / orig_sfreq.
+        onset_candidates: List[float] = []
+        if onset_sec is not None:
+            onset_candidates.append(float(onset_sec))
+        if sample_col is not None and orig_sfreq > 0:
+            onset_candidates.append(float(sample_col) / float(orig_sfreq))
+
+        if not onset_candidates:
+            dropped_parse += 1
             continue
-        # Convert onset seconds -> sample index in the *resampled* raw.
-        # This corresponds to trigger E1 (stimulus onset). E2/E3 are ignored by design.
-        try:
-            samp = int(raw.time_as_index(onset_sec)[0])
-        except Exception:
+
+        samp_abs: Optional[int] = None
+        for on in onset_candidates:
+            try:
+                # time_as_index returns 0-based index relative to raw.first_samp; Epochs expects absolute samples.
+                idx0 = int(raw.time_as_index(on, use_rounding=True)[0])
+                cand = first_samp + idx0
+            except Exception:
+                continue
+            # Bound check for epoch window
+            if (cand + tmin_samp) >= first_samp and (cand + tmax_samp) < n_samp_total:
+                samp_abs = cand
+                break
+
+        if samp_abs is None:
+            dropped_oob += 1
             continue
+
         concept_ids.append(int(concept))
-        event_samples.append(int(samp))
+        event_samples.append(int(samp_abs))
 
     if len(event_samples) == 0:
-        raise ValueError(f"No usable stimulus onset events for {subject} from {events_path}")
+        raise ValueError(
+            f"No usable stimulus onset events for {subject} from {events_path} "
+            f"(rows={len(rows)}, kept=0, dropped_parse={dropped_parse}, dropped_oob={dropped_oob}, "
+            f"orig_sfreq={orig_sfreq}, sfreq={sfreq}, first_samp={first_samp}, n_times={int(raw.n_times)})."
+        )
 
     events = np.zeros((len(event_samples), 3), dtype=np.int64)
     events[:, 0] = np.asarray(event_samples, dtype=np.int64)
@@ -287,6 +324,14 @@ def _preproc_and_epoch_subject(
         reject=None,
         verbose="ERROR",
     )
+
+    if len(epochs) == 0:
+        # Avoid caching empty subjects; surface a helpful error.
+        raise ValueError(
+            f"Empty epochs for {subject}. "
+            f"events_in={len(events)} kept=0 (tmin={tmin}, tmax={tmax}, sfreq={sfreq}, first_samp={first_samp}, n_samp_total={n_samp_total}). "
+            f"Check event timing alignment between events.tsv and raw."
+        )
 
     data = epochs.get_data().astype(np.float32, copy=False)  # [N, C, T]
     # Enforce C=64 (pad or truncate).
@@ -486,4 +531,3 @@ class Ds003825TripletDataset(Dataset):
         if self.return_concept_id:
             return eeg, image_vec, text_vec, concept
         return eeg, image_vec, text_vec
-

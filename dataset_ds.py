@@ -258,6 +258,8 @@ def _preproc_and_epoch_subject(
     concept_ids: List[int] = []
     onset_vals: List[float] = []
     sample_vals: List[float] = []
+    time_stimon_vals: List[float] = []
+    time_stimoff_vals: List[float] = []
 
     sfreq = float(raw.info["sfreq"])
     first_samp = int(getattr(raw, "first_samp", 0))
@@ -276,6 +278,12 @@ def _preproc_and_epoch_subject(
                 continue
         onset_raw = _float_or_none(r.get("onset"))
         sample_raw = _float_or_none(r.get("sample"))
+        # ds003825 events.tsv often includes these timing columns, which tend to be in seconds.
+        # In some exports, the standard BIDS `onset` column may be in samples/ms rather than seconds,
+        # while `time_stimon` matches the real experiment clock in seconds.
+        # We collect both and choose the best interpretation below.
+        time_stimon_raw = _float_or_none(r.get("time_stimon"))
+        time_stimoff_raw = _float_or_none(r.get("time_stimoff"))
         if onset_raw is None and sample_raw is None:
             dropped_parse += 1
             continue
@@ -283,6 +291,8 @@ def _preproc_and_epoch_subject(
         concept_ids.append(int(concept))
         onset_vals.append(float(onset_raw) if onset_raw is not None else float("nan"))
         sample_vals.append(float(sample_raw) if sample_raw is not None else float("nan"))
+        time_stimon_vals.append(float(time_stimon_raw) if time_stimon_raw is not None else float("nan"))
+        time_stimoff_vals.append(float(time_stimoff_raw) if time_stimoff_raw is not None else float("nan"))
 
     if len(concept_ids) == 0:
         raise ValueError(
@@ -294,6 +304,8 @@ def _preproc_and_epoch_subject(
     # Choose the best timing interpretation per subject.
     onset_arr = np.asarray(onset_vals, dtype=np.float64)
     sample_arr = np.asarray(sample_vals, dtype=np.float64)
+    time_stimon_arr = np.asarray(time_stimon_vals, dtype=np.float64) if time_stimon_vals else np.full_like(onset_arr, np.nan)
+    time_stimoff_arr = np.asarray(time_stimoff_vals, dtype=np.float64) if time_stimoff_vals else np.full_like(onset_arr, np.nan)
 
     def _sec_from(arr: np.ndarray, mode: str) -> np.ndarray:
         if mode == "as_seconds":
@@ -308,6 +320,10 @@ def _preproc_and_epoch_subject(
         raise ValueError(mode)
 
     timing_candidates: List[Tuple[str, np.ndarray]] = []
+    # Prefer explicit experiment clock columns (often in seconds) when present.
+    timing_candidates.append(("time_stimon_as_seconds", _sec_from(time_stimon_arr, "as_seconds")))
+    timing_candidates.append(("time_stimon_ms_to_seconds", _sec_from(time_stimon_arr, "ms_to_seconds")))
+    timing_candidates.append(("time_stimoff_as_seconds", _sec_from(time_stimoff_arr, "as_seconds")))
     # onset column candidates
     timing_candidates.append(("onset_as_seconds", _sec_from(onset_arr, "as_seconds")))
     timing_candidates.append(("onset_ms_to_seconds", _sec_from(onset_arr, "ms_to_seconds")))
@@ -316,6 +332,9 @@ def _preproc_and_epoch_subject(
     timing_candidates.append(("sample_as_seconds", _sec_from(sample_arr, "as_seconds")))
     timing_candidates.append(("sample_ms_to_seconds", _sec_from(sample_arr, "ms_to_seconds")))
     timing_candidates.append(("sample_samples_at_orig", _sec_from(sample_arr, "samples_at_orig")))
+
+    # Tie-break preference order: earlier is better when keep counts match.
+    pref = {name: i for i, (name, _) in enumerate(timing_candidates)}
 
     best_name = ""
     best_keep = 0
@@ -333,7 +352,7 @@ def _preproc_and_epoch_subject(
         cand_abs = first_samp + idx0
         ok = (sec2 >= 0.0) & ((cand_abs + tmin_samp) >= first_samp) & ((cand_abs + tmax_samp) < n_samp_total)
         keep = int(ok.sum())
-        if keep > best_keep:
+        if keep > best_keep or (keep == best_keep and keep > 0 and (pref.get(name, 1_000_000) < pref.get(best_name, 1_000_000))):
             best_keep = keep
             best_name = name
             best_samples_abs = cand_abs[ok]

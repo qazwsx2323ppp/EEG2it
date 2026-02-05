@@ -1,0 +1,42 @@
+# ~15-minute config using a *learnable* 64->128 input adapter (Conv1d 1x1) inside SpatialMoEEncoder.
+# This avoids channel tiling/padding and usually generalizes better across subjects.
+#
+# Requires:
+# - models/clip_models.py input_adapter support (already added)
+#
+# Use:
+#   # rebuild cache for 64ch outputs
+#   PYTHONPATH=. python utils/build_ds003825_cache.py --config-name ds003825_quick15m_adapter
+#   torchrun --nproc_per_node=1 main_ds.py --config-name ds003825_quick15m_adapter
+
+defaults:
+  - ds003825_triplet_config
+  - _self_
+
+data:
+  subjects: "sub-01,sub-02,sub-03,sub-04,sub-05,sub-06,sub-07,sub-08"
+  subject_split: [0.75, 0.25, 0.0]
+  trial_stride: 20
+
+  # Output real 64ch EEG; model will adapt to 128 internally via input_adapter.
+  n_channels_epoch: 64
+  n_channels_out: 64
+  channel_expand_mode: "zero"
+
+training:
+  distributed:
+    enabled: false
+  num_workers: 0
+  persistent_workers: false
+  batch_size: 32
+  max_steps_per_epoch: 200
+  max_val_steps: 100
+  patience: 5
+  min_delta: 0.00005
+
+  # With input_adapter, keep patch_embed frozen first (train adapter + heads + last blocks).
+  unfreeze_patch_embed: false
+
+model:
+  n_channels: 64
+

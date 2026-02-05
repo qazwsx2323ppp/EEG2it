@@ -1,0 +1,14 @@
+# ~15-minute config to test "is it a cross-subject generalization issue?"
+# Split is done by trials across the same subject pool, so domain shift is smaller than subject-split.
+#
+# Use:
+#   torchrun --nproc_per_node=1 main_ds.py --config-name ds003825_quick15m_trial
+
+defaults:
+  - ds003825_quick15m
+  - _self_
+
+data:
+  split_by: "trial"
+  trial_split: [0.9, 0.1, 0.0]
+

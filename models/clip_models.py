@@ -24,6 +24,14 @@ class SpatialMoEEncoder(nn.Module):
         self.n_channels = n_channels
         self.n_samples = n_samples
         self.embedding_dim = embedding_dim
+        self.backbone_in_chans = 128
+
+        # Optional input adapter (e.g., paper ds003825 provides 64ch EEG):
+        # Map (B, C, T) -> (B, 128, T) so the pretrained DreamDiffusion backbone
+        # always receives its expected channel count.
+        self.input_adapter = None
+        if int(n_channels) != int(self.backbone_in_chans):
+            self.input_adapter = nn.Conv1d(int(n_channels), int(self.backbone_in_chans), kernel_size=1, bias=False)
         
         # 注册索引 (用于生成 mask)
         # self.register_buffer('idx_vis', torch.tensor(visual_indices, dtype=torch.long))
@@ -195,10 +203,11 @@ class SpatialMoEEncoder(nn.Module):
         # 1. 预处理：Padding 到 512
         
         x_padded = x
+        x_for_backbone = x_padded if self.input_adapter is None else self.input_adapter(x_padded)
 
         # 2. 通过共享 Backbone 提取全局特征
         # latent shape: [batch, num_patches, 1024]
-        latent, _, _ = self.backbone.forward_encoder(x_padded, mask_ratio=0.0)
+        latent, _, _ = self.backbone.forward_encoder(x_for_backbone, mask_ratio=0.0)
         
 
         ##暂时关闭MOE策略，先验证BACKONE的可行性

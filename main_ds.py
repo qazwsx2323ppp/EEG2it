@@ -826,21 +826,34 @@ def main(cfg: DictConfig):
                 )
 
             if bool(cfg.training.get("print_epoch_losses", True)):
+                present_concepts = int(val_results.get("present_concepts", 0) or 0)
+                chance_top1 = (1.0 / present_concepts) if present_concepts > 0 else 0.0
+                txt_pos = float(val_results["txt_metrics"].get("mean_positive_similarity", 0.0))
+                txt_neg = float(val_results["txt_metrics"].get("mean_negative_similarity", 0.0))
+                txt_sep = float(val_results["txt_metrics"].get("separation_ratio", 0.0))
                 if text_only:
                     print(
                         f"[epoch {epoch}] "
                         f"train total={train_loss:.4f} txt={train_loss_txt:.4f} | "
                         f"val total={val_loss:.4f} txt={val_loss_txt:.4f} | "
-                        f"val txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% | "
+                        f"val txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% "
+                        f"(chance={chance_top1*100:.2f}%, present={present_concepts}) | "
+                        f"sim pos={txt_pos:.3f} neg={txt_neg:.3f} sep={txt_sep:.3f} | "
                         f"steps={steps}"
                     )
                 else:
+                    img_pos = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_positive_similarity", 0.0))
+                    img_neg = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_negative_similarity", 0.0))
+                    img_sep = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("separation_ratio", 0.0))
                     print(
                         f"[epoch {epoch}] "
                         f"train total={train_loss:.4f} img={train_loss_img:.4f} txt={train_loss_txt:.4f} | "
                         f"val total={val_loss:.4f} img={val_loss_img:.4f} txt={val_loss_txt:.4f} | "
                         f"val img@1={(0.0 if val_results.get('img_metrics') is None else val_results['img_metrics']['top_1_accuracy']*100):.2f}% "
-                        f"txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% | "
+                        f"txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% "
+                        f"(chance={chance_top1*100:.2f}%, present={present_concepts}) | "
+                        f"sim txt(pos/neg/sep)={txt_pos:.3f}/{txt_neg:.3f}/{txt_sep:.3f} "
+                        f"img(pos/neg/sep)={img_pos:.3f}/{img_neg:.3f}/{img_sep:.3f} | "
                         f"steps={steps}"
                     )
             else:

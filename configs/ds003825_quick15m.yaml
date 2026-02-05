@@ -1,0 +1,44 @@
+# ~15-minute sanity config for ds003825 paper-style dataset.
+# Goal: more subjects than `ds003825_quick.yaml`, but still fast iterations.
+#
+# Suggested flow (server):
+#   1) Prebuild cache for these subjects (once):
+#        PYTHONPATH=. python utils/build_ds003825_cache.py --config-name ds003825_quick15m
+#   2) Train:
+#        torchrun --nproc_per_node=1 main_ds.py --config-name ds003825_quick15m
+
+defaults:
+  - ds003825_triplet_config
+  - _self_
+
+data:
+  # Increase subject count for a more realistic val signal while keeping it fast.
+  subjects: "sub-01,sub-02,sub-03,sub-04,sub-05,sub-06,sub-07,sub-08"
+  exclude_subjects: ""
+  # 6 train / 2 val / 0 test
+  subject_split: [0.75, 0.25, 0.0]
+
+  # Keep the per-epoch dataset effectively smaller.
+  trial_stride: 20
+
+  # Keep model input compatible with DreamDiffusion backbone.
+  n_channels_epoch: 64
+  n_channels_out: 128
+  n_samples_out: 512
+  interp_chunk: 128
+
+training:
+  epochs: 20
+  batch_size: 32
+  num_workers: 0
+  persistent_workers: false
+
+  # Keep each epoch short so you can judge quickly.
+  max_steps_per_epoch: 200
+  max_val_steps: 100
+  patience: 5
+  min_delta: 0.00005
+
+  distributed:
+    enabled: false
+

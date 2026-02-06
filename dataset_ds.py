@@ -498,6 +498,14 @@ class Ds003825TripletDataset(Dataset):
         self.zscore = bool(_safe_get(cfg_data, "zscore", False))
         self.zscore_eps = float(_safe_get(cfg_data, "zscore_eps", 1e-6))
         self.trial_stride = int(_safe_get(cfg_data, "trial_stride", 1))
+        # Training-time EEG aggregation to improve SNR for RSVP single-trial supervision.
+        # - "trial": return single-trial epoch (default)
+        # - "concept_mean": average K trials of the same (subject, concept_id) within the split
+        self.train_mode = str(_safe_get(cfg_data, "train_mode", "trial")).strip().lower()
+        self.concept_mean_k = int(_safe_get(cfg_data, "concept_mean_k", 1))
+        self.concept_mean_with_replacement = bool(_safe_get(cfg_data, "concept_mean_with_replacement", True))
+        # If True and zscore enabled, apply zscore to each trial before averaging. Otherwise average then zscore.
+        self.concept_mean_zscore_before_avg = bool(_safe_get(cfg_data, "concept_mean_zscore_before_avg", True))
 
         # Vectors
         text_vec_path = str(_safe_get(cfg_data, "text_vec_path", ""))
@@ -574,6 +582,15 @@ class Ds003825TripletDataset(Dataset):
         # Expose concept ids for unique-concept sampler compatibility.
         self.indices = np.arange(len(self._trials), dtype=np.int64)
         self.ds_concept_ids = np.asarray([t.concept_id for t in self._trials], dtype=np.int32)
+
+        # For concept-mean mode: pool of epoch indices per (subject, concept_id) within this split.
+        self._concept_pool: Dict[Tuple[str, int], np.ndarray] = {}
+        if self.mode == "train" and self.train_mode == "concept_mean" and int(self.concept_mean_k) > 1:
+            pools: Dict[Tuple[str, int], List[int]] = {}
+            for tr in self._trials:
+                key = (tr.subject, int(tr.concept_id))
+                pools.setdefault(key, []).append(int(tr.epoch_index))
+            self._concept_pool = {k: np.asarray(v, dtype=np.int32) for k, v in pools.items()}
 
         if _is_rank0():
             print(f"[ds003825] mode={self.mode} trials={len(self._trials)} cache_dir={self.cache_dir}")
@@ -951,15 +968,49 @@ class Ds003825TripletDataset(Dataset):
         tr = self._trials[int(idx)]
         subj = tr.subject
         obj = self._load_subject(subj)
-        if self.cache_format == "pt":
-            eeg = obj["eeg"][int(tr.epoch_index)]  # [C,T] float32
-        else:
-            eeg_np = obj["eeg_mm"][int(tr.epoch_index)]  # numpy memmap slice [C,T]
-            eeg = torch.from_numpy(np.asarray(eeg_np, dtype=np.float32))
-
-        if self.zscore:
-            eeg = _zscore_channelwise(eeg, eps=float(self.zscore_eps))
         concept = int(tr.concept_id)
+
+        # Optional: concept-mean aggregation for training.
+        if self.mode == "train" and self.train_mode == "concept_mean" and int(self.concept_mean_k) > 1:
+            pool = self._concept_pool.get((subj, concept))
+            if pool is None or int(pool.size) == 0:
+                epoch_indices = [int(tr.epoch_index)]
+            else:
+                k = int(self.concept_mean_k)
+                if (not self.concept_mean_with_replacement) and int(pool.size) >= k:
+                    # Sample without replacement (deterministic per worker+idx).
+                    gen = torch.Generator()
+                    gen.manual_seed(int(torch.initial_seed()) + int(idx))
+                    perm = torch.randperm(int(pool.size), generator=gen)[:k].tolist()
+                    epoch_indices = [int(pool[p]) for p in perm]
+                else:
+                    # Sample with replacement (works even when pool.size < k).
+                    gen = torch.Generator()
+                    gen.manual_seed(int(torch.initial_seed()) + int(idx))
+                    picks = torch.randint(0, int(pool.size), (k,), generator=gen).tolist()
+                    epoch_indices = [int(pool[p]) for p in picks]
+
+            # Fetch [K,C,T] and average.
+            if self.cache_format == "pt":
+                eeg_k = obj["eeg"][epoch_indices]  # [K,C,T]
+            else:
+                eeg_np = np.asarray(obj["eeg_mm"][epoch_indices], dtype=np.float32)  # [K,C,T]
+                eeg_k = torch.from_numpy(eeg_np)
+
+            if self.zscore and self.concept_mean_zscore_before_avg:
+                eeg_k = _zscore_channelwise(eeg_k, eps=float(self.zscore_eps))  # broadcast over leading dims
+            eeg = eeg_k.float().mean(dim=0)  # [C,T]
+            if self.zscore and (not self.concept_mean_zscore_before_avg):
+                eeg = _zscore_channelwise(eeg, eps=float(self.zscore_eps))
+        else:
+            if self.cache_format == "pt":
+                eeg = obj["eeg"][int(tr.epoch_index)]  # [C,T] float32
+            else:
+                eeg_np = obj["eeg_mm"][int(tr.epoch_index)]  # numpy memmap slice [C,T]
+                eeg = torch.from_numpy(np.asarray(eeg_np, dtype=np.float32))
+
+            if self.zscore:
+                eeg = _zscore_channelwise(eeg, eps=float(self.zscore_eps))
         image_vec = self.all_image_vectors[concept]
         text_vec = self.all_text_vectors[concept]
         if self.return_concept_id:

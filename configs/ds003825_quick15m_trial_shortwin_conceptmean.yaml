@@ -1,0 +1,21 @@
+# Concept-mean training variant (A): average K trials per (subject, concept) to improve SNR.
+#
+# Use (server):
+#   1) Ensure cache for ds003825_quick15m_trial_shortwin exists (no extra cache needed; aggregation is runtime).
+#   2) Train:
+#        torchrun --standalone --nproc_per_node=1 main_ds.py --config-name ds003825_quick15m_trial_shortwin_conceptmean
+
+defaults:
+  - ds003825_quick15m_trial_shortwin
+  - _self_
+
+data:
+  # Average K trials (within the split) for the same (subject, concept_id).
+  train_mode: "concept_mean"
+  concept_mean_k: 5
+  concept_mean_with_replacement: true
+  concept_mean_zscore_before_avg: true
+
+training:
+  # Slightly fewer steps since each sample is more expensive (K reads).
+  max_steps_per_epoch: 200

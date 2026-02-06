@@ -11,4 +11,4 @@ defaults:
 data:
   split_by: "trial"
   trial_split: [0.9, 0.1, 0.0]
-
+  trial_group_by: "block"

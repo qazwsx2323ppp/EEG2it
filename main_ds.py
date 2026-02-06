@@ -504,6 +504,34 @@ def evaluate_concept_retrieval(
         txt_metrics = {f"top_{k}_accuracy": 0.0 for k in k_values}
         txt_metrics.update({"mean_positive_similarity": 0.0, "mean_negative_similarity": 0.0, "separation_ratio": 0.0})
         img_metrics = None
+
+    # Concept count diagnostics (helps detect "many concepts have only 1 trial" instability).
+    count_stats = None
+    try:
+        present_counts = counts[present_mask].detach().float().cpu().numpy()
+        if present_counts.size > 0:
+            present_counts_sorted = np.sort(present_counts)
+            def q(p: float) -> float:
+                if present_counts_sorted.size == 1:
+                    return float(present_counts_sorted[0])
+                idx = int(round((present_counts_sorted.size - 1) * p))
+                idx = max(0, min(int(idx), int(present_counts_sorted.size - 1)))
+                return float(present_counts_sorted[idx])
+
+            count_stats = {
+                "n_present": int(present_counts_sorted.size),
+                "min": float(present_counts_sorted[0]),
+                "p25": q(0.25),
+                "median": q(0.50),
+                "p75": q(0.75),
+                "p90": q(0.90),
+                "max": float(present_counts_sorted[-1]),
+                "mean": float(present_counts_sorted.mean()),
+                "n_eq_1": int((present_counts_sorted == 1).sum()),
+                "n_lt_3": int((present_counts_sorted < 3).sum()),
+            }
+    except Exception:
+        count_stats = None
     return {
         "loss": avg_loss,
         "loss_img": avg_loss_img,
@@ -511,6 +539,7 @@ def evaluate_concept_retrieval(
         "img_metrics": img_metrics,
         "txt_metrics": txt_metrics,
         "present_concepts": present,
+        "concept_count_stats": count_stats,
         "steps": steps,
     }
 
@@ -931,6 +960,7 @@ def main(cfg: DictConfig):
                     "loss_text": val_loss_txt,
                     "steps": val_steps,
                     "present_concepts": int(val_results.get("present_concepts", 0)),
+                    "concept_count_stats": val_results.get("concept_count_stats"),
                     "img_metrics": val_results["img_metrics"],
                     "txt_metrics": val_results["txt_metrics"],
                 },
@@ -945,6 +975,7 @@ def main(cfg: DictConfig):
                     "loss_text": float(train_eval_results["loss_txt"]),
                     "steps": int(train_eval_results.get("steps", 0)),
                     "present_concepts": int(train_eval_results.get("present_concepts", 0)),
+                    "concept_count_stats": train_eval_results.get("concept_count_stats"),
                     "img_metrics": train_eval_results["img_metrics"],
                     "txt_metrics": train_eval_results["txt_metrics"],
                 }
@@ -1000,6 +1031,12 @@ def main(cfg: DictConfig):
                         f"(chance@1={tr_chance1*100:.2f}%, present={tr_present}) "
                         f"| sim pos={tr_txt_pos:.3f} neg={tr_txt_neg:.3f} gap={tr_txt_gap:.3f} sep={tr_txt_sep:.3f}"
                     )
+                    tr_cs = train_eval_results.get("concept_count_stats")
+                    if isinstance(tr_cs, dict) and "median" in tr_cs:
+                        train_eval_str += (
+                            f" | cnt med={int(tr_cs['median'])} p90={int(tr_cs.get('p90', 0))} "
+                            f"max={int(tr_cs.get('max', 0))} eq1={int(tr_cs.get('n_eq_1', 0))}"
+                        )
                 if text_only:
                     print(
                         f"[epoch {epoch}] "
@@ -1011,6 +1048,15 @@ def main(cfg: DictConfig):
                         f"{train_eval_str} | "
                         f"steps={steps}"
                     )
+                    cs = val_results.get("concept_count_stats")
+                    if isinstance(cs, dict) and "median" in cs:
+                        print(
+                            f"[val concept_counts] "
+                            f"present={int(cs.get('n_present', present_concepts))} "
+                            f"min={int(cs.get('min', 0))} med={int(cs.get('median', 0))} "
+                            f"p90={int(cs.get('p90', 0))} max={int(cs.get('max', 0))} "
+                            f"eq1={int(cs.get('n_eq_1', 0))} lt3={int(cs.get('n_lt_3', 0))}"
+                        )
                 else:
                     img_pos = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_positive_similarity", 0.0))
                     img_neg = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_negative_similarity", 0.0))
@@ -1028,6 +1074,15 @@ def main(cfg: DictConfig):
                         f"{train_eval_str} | "
                         f"steps={steps}"
                     )
+                    cs = val_results.get("concept_count_stats")
+                    if isinstance(cs, dict) and "median" in cs:
+                        print(
+                            f"[val concept_counts] "
+                            f"present={int(cs.get('n_present', present_concepts))} "
+                            f"min={int(cs.get('min', 0))} med={int(cs.get('median', 0))} "
+                            f"p90={int(cs.get('p90', 0))} max={int(cs.get('max', 0))} "
+                            f"eq1={int(cs.get('n_eq_1', 0))} lt3={int(cs.get('n_lt_3', 0))}"
+                        )
             else:
                 print(f"[epoch {epoch}] train={train_loss:.4f} val={val_loss:.4f} (steps={steps})")
 

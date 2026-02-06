@@ -139,6 +139,7 @@ class _TrialRef:
     subject: str
     epoch_index: int
     concept_id: int
+    group_key: str = ""
 
 
 class _SubjectLRU:
@@ -214,6 +215,7 @@ def _preproc_and_epoch_subject(
     channel_expand_mode: str,
     n_samples_out: int,
     interp_chunk: int,
+    trial_group_by: str,
     verbose: bool,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -257,6 +259,7 @@ def _preproc_and_epoch_subject(
     # (Rule 2 & 6) Build stimulus-onset events from events table.
     rows = _read_events_table(events_path)
     concept_ids: List[int] = []
+    group_ids: List[int] = []
     onset_vals: List[float] = []
     sample_vals: List[float] = []
     time_stimon_vals: List[float] = []
@@ -269,6 +272,7 @@ def _preproc_and_epoch_subject(
     tmax_samp = int(round(tmax * sfreq))
 
     dropped_parse = 0
+    group_by = str(trial_group_by or "none").strip().lower()
     for r in rows:
         concept = _int_or_none(r.get("objectnumber"))
         if concept is None or concept < 0:
@@ -290,6 +294,12 @@ def _preproc_and_epoch_subject(
             continue
 
         concept_ids.append(int(concept))
+        if group_by in {"block", "blocksequencenumber"}:
+            group_ids.append(int(_int_or_none(r.get("blocksequencenumber")) or 0))
+        elif group_by in {"sequence", "sequencenumber"}:
+            group_ids.append(int(_int_or_none(r.get("sequencenumber")) or 0))
+        else:
+            group_ids.append(0)
         onset_vals.append(float(onset_raw) if onset_raw is not None else float("nan"))
         sample_vals.append(float(sample_raw) if sample_raw is not None else float("nan"))
         time_stimon_vals.append(float(time_stimon_raw) if time_stimon_raw is not None else float("nan"))
@@ -379,8 +389,10 @@ def _preproc_and_epoch_subject(
     cand_abs_best = first_samp + idx0_best
     ok_best = (sec_best >= 0.0) & ((cand_abs_best + tmin_samp) >= first_samp) & ((cand_abs_best + tmax_samp) < n_samp_total)
     concept_kept = np.asarray(concept_ids, dtype=np.int32)[ok_best]
+    group_kept = np.asarray(group_ids, dtype=np.int32)[ok_best]
     event_samples = cand_abs_best[ok_best].astype(np.int64, copy=False).tolist()
     concept_ids = concept_kept.tolist()
+    group_ids = group_kept.tolist()
 
     if verbose and _is_rank0():
         print(f"[ds003825] {subject}: timing={best_name} kept={best_keep}/{len(ok_best)} dropped_oob={dropped_oob}")
@@ -461,6 +473,7 @@ def _preproc_and_epoch_subject(
     return {
         "eeg": torch.from_numpy(data),  # float32 [N,C,T]
         "concept_id": torch.tensor(concept_ids[: data.shape[0]], dtype=torch.int16),
+        "group_id": torch.tensor(group_ids[: data.shape[0]], dtype=torch.int32),
     }
 
 
@@ -547,6 +560,9 @@ class Ds003825TripletDataset(Dataset):
         self.split_index = int(split_index)
         self.subject_split = tuple(_safe_get(cfg_data, "subject_split", (0.8, 0.1, 0.1)))
         self.trial_split = tuple(_safe_get(cfg_data, "trial_split", (0.8, 0.1, 0.1)))
+        # For trial split, optionally group trials by block/sequence to reduce temporal leakage.
+        # Values: "none" | "block" | "sequence"
+        self.trial_group_by = str(_safe_get(cfg_data, "trial_group_by", "none")).strip().lower()
 
         # LRU cache for subject tensors (note: each DataLoader worker has its own Dataset copy)
         self._lru = _SubjectLRU(max_subjects=int(_safe_get(cfg_data, "lru_subjects", 1)))
@@ -586,6 +602,7 @@ class Ds003825TripletDataset(Dataset):
         return {
             "eeg": os.path.join(self.cache_dir, f"{base}_eeg.npy"),
             "concept": os.path.join(self.cache_dir, f"{base}_concept.npy"),
+            "group": os.path.join(self.cache_dir, f"{base}_group.npy"),
         }
 
     def _lock_path(self, subject: str) -> str:
@@ -636,7 +653,14 @@ class Ds003825TripletDataset(Dataset):
             raise FileNotFoundError(f"Missing cache files: {eeg_path} / {concept_path}")
         eeg_mm = np.load(eeg_path, mmap_mode="r")  # [N,C,T] float32 memmap
         concept_np = np.load(concept_path)  # small, load fully
-        return {"eeg_mm": eeg_mm, "concept_id": torch.from_numpy(concept_np).to(torch.int16)}
+        group_np = None
+        group_path = paths.get("group")
+        if group_path and os.path.isfile(group_path):
+            group_np = np.load(group_path)
+        out: Dict[str, Any] = {"eeg_mm": eeg_mm, "concept_id": torch.from_numpy(concept_np).to(torch.int16)}
+        if group_np is not None:
+            out["group_id"] = torch.from_numpy(group_np).to(torch.int32)
+        return out
 
     def _ensure_subject_cached(self, subject: str) -> None:
         paths = self._cache_paths(subject)
@@ -645,7 +669,8 @@ class Ds003825TripletDataset(Dataset):
             if os.path.isfile(paths["pt"]):
                 return
         else:
-            if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
+            need_group = self.split_by != "subject" and self.trial_group_by not in {"", "none"}
+            if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or os.path.isfile(paths["group"])):
                 return
 
         if not self.cache_build:
@@ -671,7 +696,8 @@ class Ds003825TripletDataset(Dataset):
                     if os.path.isfile(paths["pt"]):
                         return
                 else:
-                    if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
+                    need_group = self.split_by != "subject" and self.trial_group_by not in {"", "none"}
+                    if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or os.path.isfile(paths["group"])):
                         return
                 if (time.time() - start) > float(self.cache_lock_timeout_s):
                     raise TimeoutError(f"Timed out waiting for rank0 cache build for {subject} under {self.cache_dir}")
@@ -692,7 +718,8 @@ class Ds003825TripletDataset(Dataset):
                 if os.path.isfile(paths["pt"]):
                     return
             else:
-                if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
+                need_group = self.split_by != "subject" and self.trial_group_by not in {"", "none"}
+                if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or os.path.isfile(paths["group"])):
                     return
 
             if _is_rank0():
@@ -714,6 +741,7 @@ class Ds003825TripletDataset(Dataset):
                 channel_expand_mode=self.channel_expand_mode,
                 n_samples_out=self.n_samples_out,
                 interp_chunk=self.interp_chunk,
+                trial_group_by=self.trial_group_by,
                 verbose=False,
             )
 
@@ -725,8 +753,10 @@ class Ds003825TripletDataset(Dataset):
             else:
                 eeg = tensors["eeg"].numpy().astype(np.float32, copy=False)
                 concept = tensors["concept_id"].numpy().astype(np.int16, copy=False)
+                group = tensors["group_id"].numpy().astype(np.int32, copy=False) if "group_id" in tensors else None
                 eeg_path = paths["eeg"]
                 concept_path = paths["concept"]
+                group_path = paths.get("group")
                 # NOTE: numpy.save appends ".npy" if the filename doesn't end with it.
                 # Ensure our tmp file names end with ".npy" so os.replace can find them.
                 eeg_tmp = f"{eeg_path}.tmp.{os.getpid()}.npy"
@@ -735,6 +765,10 @@ class Ds003825TripletDataset(Dataset):
                 np.save(concept_tmp, concept)
                 os.replace(eeg_tmp, eeg_path)
                 os.replace(concept_tmp, concept_path)
+                if group is not None and group_path:
+                    group_tmp = f"{group_path}.tmp.{os.getpid()}.npy"
+                    np.save(group_tmp, group)
+                    os.replace(group_tmp, group_path)
         finally:
             self._release_lock(lock_path)
 
@@ -819,19 +853,31 @@ class Ds003825TripletDataset(Dataset):
                 obj = self._safe_load_cache(self._cache_paths(sub)["pt"])
                 n_epochs = int(obj["eeg"].shape[0])
                 concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
+                group = obj.get("group_id", None)
+                group_np = None if group is None else np.asarray(group, dtype=np.int32)
             else:
                 obj = self._safe_load_cache_npy(self._cache_paths(sub))
                 n_epochs = int(obj["eeg_mm"].shape[0])
                 concept = obj["concept_id"].numpy().astype(np.int32, copy=False)
+                group_t = obj.get("group_id", None)
+                group_np = None if group_t is None else group_t.numpy().astype(np.int32, copy=False)
             for i in range(n_epochs):
                 if stride > 1 and (i % stride) != 0:
                     continue
                 cid = int(concept[i])
                 if 0 <= cid < int(self.all_text_vectors.shape[0]):
-                    all_trials.append(_TrialRef(subject=sub, epoch_index=i, concept_id=cid))
+                    gkey = ""
+                    if self.trial_group_by not in {"", "none"}:
+                        if group_np is None:
+                            raise FileNotFoundError(
+                                f"trial_group_by={self.trial_group_by} requires cached group ids. "
+                                f"Rebuild cache for {sub} (expected *_group.npy)."
+                            )
+                        gid = int(group_np[i])
+                        gkey = f"{sub}:{gid}"
+                    all_trials.append(_TrialRef(subject=sub, epoch_index=i, concept_id=cid, group_key=gkey))
 
         rng = random.Random(self.seed + self.split_index)
-        rng.shuffle(all_trials)
         p_train, p_val, p_test = self.trial_split
         n = len(all_trials)
         n_test = int(round(n * float(p_test))) if float(p_test) > 0.0 else 0
@@ -841,9 +887,44 @@ class Ds003825TripletDataset(Dataset):
                 n_val = max(0, n_val - 1)
             if (n - n_test - n_val) <= 0 and n_test > 0:
                 n_test = max(0, n_test - 1)
-        test = all_trials[:n_test]
-        val = all_trials[n_test : n_test + n_val]
-        train = all_trials[n_test + n_val :]
+
+        if self.trial_group_by in {"", "none"}:
+            rng.shuffle(all_trials)
+            test = all_trials[:n_test]
+            val = all_trials[n_test : n_test + n_val]
+            train = all_trials[n_test + n_val :]
+        else:
+            # Group-aware split to reduce temporal leakage (e.g., by block/sequence).
+            groups: Dict[str, List[_TrialRef]] = {}
+            for tr in all_trials:
+                groups.setdefault(tr.group_key, []).append(tr)
+            keys = list(groups.keys())
+            rng.shuffle(keys)
+
+            test: List[_TrialRef] = []
+            val: List[_TrialRef] = []
+            train: List[_TrialRef] = []
+
+            # Greedy allocation by group sizes to hit target trial counts.
+            cnt_test = 0
+            cnt_val = 0
+            for k in keys:
+                g = groups[k]
+                if cnt_test < n_test:
+                    test.extend(g)
+                    cnt_test += len(g)
+                elif cnt_val < n_val:
+                    val.extend(g)
+                    cnt_val += len(g)
+                else:
+                    train.extend(g)
+
+            # Ensure at least 1 train trial if possible.
+            if not train and (val or test):
+                if val:
+                    train.append(val.pop())
+                elif test:
+                    train.append(test.pop())
 
         if self.mode == "train":
             self._trials = train

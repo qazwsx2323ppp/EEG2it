@@ -1,0 +1,21 @@
+# Trial-split + shorter window variant of ds003825 quick sanity runs.
+#
+# Goal: distinguish "pipeline can learn within subject" from "cross-subject generalization fails",
+# while also reducing RSVP overlap noise via tmax=0.5s.
+#
+# Use (server):
+#   1) Build cache:
+#        PYTHONPATH=. python utils/build_ds003825_cache.py --config-name ds003825_quick15m_trial_shortwin
+#   2) Train:
+#        torchrun --standalone --nproc_per_node=1 main_ds.py --config-name ds003825_quick15m_trial_shortwin
+
+defaults:
+  - ds003825_quick15m_trial
+  - _self_
+
+data:
+  tmax: 0.5
+
+training:
+  max_steps_per_epoch: 300
+  max_val_steps: 150

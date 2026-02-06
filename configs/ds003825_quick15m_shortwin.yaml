@@ -1,0 +1,24 @@
+# ~15-minute sanity config for ds003825 with a shorter RSVP window.
+#
+# Why: RSVP is ~10Hz (new stimulus every 100ms). Using tmax=1.0s means each epoch
+# contains responses to many subsequent stimuli -> strong label noise for single-trial supervision.
+# This config shortens the window to reduce contamination and quickly test learnability.
+#
+# Use (server):
+#   1) Build cache (new cache filenames because tmax differs):
+#        PYTHONPATH=. python utils/build_ds003825_cache.py --config-name ds003825_quick15m_shortwin
+#   2) Train:
+#        torchrun --standalone --nproc_per_node=1 main_ds.py --config-name ds003825_quick15m_shortwin
+
+defaults:
+  - ds003825_quick15m
+  - _self_
+
+data:
+  # Shorter post-onset window to reduce RSVP overlap.
+  tmax: 0.5
+
+training:
+  # Keep epochs short (you can increase once metrics move above chance).
+  max_steps_per_epoch: 300
+  max_val_steps: 150

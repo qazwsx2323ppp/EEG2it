@@ -10,6 +10,7 @@ import sys
 from datetime import datetime
 
 import hydra
+import numpy as np
 import torch
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf

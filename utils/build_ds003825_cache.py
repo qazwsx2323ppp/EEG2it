@@ -60,6 +60,11 @@ def main():
         default="",
         help="How to expand from n_channels_epoch to n_channels_out: 'zero' (pad zeros) or 'repeat' (tile channels).",
     )
+    ap.add_argument(
+        "--prune-cezero",
+        action="store_true",
+        help="Delete any existing cezero .npy cache files under --cache-dir before building.",
+    )
     ap.add_argument("--n-samples-out", type=int, default=None, help="Samples fed to model (DreamDiffusion expects 512).")
     ap.add_argument("--interp-chunk", type=int, default=None, help="Chunk size (epochs) for time interpolation.")
     args = ap.parse_args()
@@ -119,7 +124,7 @@ def main():
     tmax = float(args.tmax if args.tmax is not None else cfg_get("data.tmax", 1.0))
     n_channels_epoch = int(args.n_channels_epoch if args.n_channels_epoch is not None else cfg_get("data.n_channels_epoch", 64))
     n_channels_out = int(args.n_channels_out if args.n_channels_out is not None else cfg_get("data.n_channels_out", 128))
-    channel_expand_mode = str(args.channel_expand_mode or cfg_get("data.channel_expand_mode", "zero")).strip().lower()
+    channel_expand_mode = str(args.channel_expand_mode or cfg_get("data.channel_expand_mode", "repeat")).strip().lower()
     n_samples_out = int(args.n_samples_out if args.n_samples_out is not None else cfg_get("data.n_samples_out", 512))
     interp_chunk = int(args.interp_chunk if args.interp_chunk is not None else cfg_get("data.interp_chunk", 256))
 
@@ -132,6 +137,33 @@ def main():
         )
 
     os.makedirs(cache_dir, exist_ok=True)
+
+    if args.prune_cezero:
+        cache_dir_p = Path(cache_dir)
+        patterns = [
+            "*_cezero_*_eeg.npy",
+            "*_cezero_*_concept.npy",
+        ]
+        to_delete = []
+        for pat in patterns:
+            to_delete.extend(cache_dir_p.glob(pat))
+        # De-dupe while keeping stable order.
+        seen = set()
+        unique = []
+        for p in to_delete:
+            if p in seen:
+                continue
+            seen.add(p)
+            unique.append(p)
+        if unique:
+            print(f"[ds003825] prune: deleting {len(unique)} cezero cache files under {cache_dir}")
+            for p in unique:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+        else:
+            print(f"[ds003825] prune: no cezero cache files found under {cache_dir}")
 
     # Construct a minimal cfg_data object the dataset understands.
     cfg_data = {

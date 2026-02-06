@@ -502,7 +502,8 @@ class Ds003825TripletDataset(Dataset):
         self.tmax = float(_safe_get(cfg_data, "tmax", 1.0))
         self.n_channels_epoch = int(_safe_get(cfg_data, "n_channels_epoch", 64))
         self.n_channels_out = int(_safe_get(cfg_data, "n_channels_out", 128))
-        self.channel_expand_mode = str(_safe_get(cfg_data, "channel_expand_mode", "zero")).strip().lower()
+        # Default to "repeat" because "zero" pads half channels with zeros (often harms learnability).
+        self.channel_expand_mode = str(_safe_get(cfg_data, "channel_expand_mode", "repeat")).strip().lower()
         self.n_samples_out = int(_safe_get(cfg_data, "n_samples_out", 512))
         self.interp_chunk = int(_safe_get(cfg_data, "interp_chunk", 256))
 

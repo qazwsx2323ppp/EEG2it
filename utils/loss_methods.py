@@ -53,6 +53,29 @@ class InfoNCE(nn.Module):
         return loss
 
 
+class ClipSoftmaxLoss(nn.Module):
+    """
+    Full-class softmax loss over *all* concept targets.
+
+    Why: For ds003825, the label space is large (1854 concepts). In-batch InfoNCE only
+    uses batch_size negatives, which can be too weak/noisy. This loss computes logits
+    against all target vectors and applies cross-entropy with concept_id labels.
+    """
+
+    def __init__(self, initial_temperature=0.07):
+        super().__init__()
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / initial_temperature))
+        self.cross_entropy = nn.CrossEntropyLoss()
+
+    def forward(self, eeg_features: torch.Tensor, all_target_features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # eeg_features: [B, D] (assumed normalized)
+        # all_target_features: [N, D] (assumed normalized)
+        # labels: [B] in [0, N)
+        logit_scale = self.logit_scale.exp()
+        logits = (eeg_features @ all_target_features.T) * logit_scale  # [B, N]
+        return self.cross_entropy(logits, labels.long())
+
+
 class SigLipLoss(nn.Module):
     """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
     (这是原始文件中的另一个损失函数，我们保留它以备将来实验)

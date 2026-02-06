@@ -19,7 +19,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from dataset import TripletDataset
 from models.clip_models import SpatialMoEEncoder
-from utils.loss_methods import InfoNCE
+from utils.loss_methods import ClipSoftmaxLoss, InfoNCE
 from utils.batch_samplers import RepeatBatchSampler, UniqueConceptBatchSampler
 
 
@@ -204,6 +204,9 @@ def train_one_epoch(
     sanity_check: bool = False,
     sanity_check_once: bool = True,
     rank: int = 0,
+    loss_mode: str = "infonce",
+    all_text_targets: torch.Tensor | None = None,
+    all_image_targets: torch.Tensor | None = None,
 ):
     model.train()
     total_loss = 0.0
@@ -230,11 +233,25 @@ def train_one_epoch(
             else:
                 eeg_img_embeddings, eeg_text_embeddings = outputs
 
-            if loss_fn_img is not None and alpha > 0:
-                loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+            loss_mode_l = str(loss_mode or "infonce").strip().lower()
+            if loss_mode_l == "softmax_all":
+                if concept_ids is None:
+                    raise RuntimeError("softmax_all loss requires data.return_concept_id=true")
+                if all_text_targets is None:
+                    raise RuntimeError("softmax_all loss requires all_text_targets")
+                if loss_fn_img is not None and alpha > 0:
+                    if all_image_targets is None:
+                        raise RuntimeError("softmax_all img loss requires all_image_targets")
+                    loss_img = loss_fn_img(eeg_img_embeddings, all_image_targets, concept_ids)
+                else:
+                    loss_img = torch.tensor(0.0, device=device)
+                loss_txt = loss_fn_txt(eeg_text_embeddings, all_text_targets, concept_ids)
             else:
-                loss_img = torch.tensor(0.0, device=device)
-            loss_txt = loss_fn_txt(eeg_text_embeddings, text_vecs)
+                if loss_fn_img is not None and alpha > 0:
+                    loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+                else:
+                    loss_img = torch.tensor(0.0, device=device)
+                loss_txt = loss_fn_txt(eeg_text_embeddings, text_vecs)
             loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
 
             loss_to_backprop = loss / max(1, grad_accum_steps)
@@ -369,6 +386,7 @@ def evaluate_concept_retrieval(
     distributed: bool,
     rank: int,
     k_values=(1, 5, 10),
+    loss_mode: str = "infonce",
 ):
     """
     Evaluate by averaging EEG embeddings per concept id and computing retrieval against concept targets.
@@ -384,6 +402,15 @@ def evaluate_concept_retrieval(
     total_loss_txt = torch.tensor(0.0, device=device)
     steps = 0
 
+    # Use the dataset's concept targets
+    ds = dataloader.dataset
+    target_img = ds.all_image_vectors.to(device)
+    target_txt = ds.all_text_vectors.to(device)
+    target_img = target_img / (target_img.norm(dim=-1, keepdim=True) + 1e-12)
+    target_txt = target_txt / (target_txt.norm(dim=-1, keepdim=True) + 1e-12)
+
+    loss_mode_l = str(loss_mode or "infonce").strip().lower()
+
     for batch in tqdm(dataloader, desc="Validation", disable=rank != 0):
         if _dist_any_stop(device):
             raise KeyboardInterrupt()
@@ -397,8 +424,16 @@ def evaluate_concept_retrieval(
         else:
             eeg_img_emb, eeg_txt_emb = outputs
 
-        loss_img = loss_fn_img(eeg_img_emb, image_vecs) if (loss_fn_img is not None and alpha > 0) else torch.tensor(0.0, device=device)
-        loss_txt = loss_fn_txt(eeg_txt_emb, text_vecs)
+        if loss_mode_l == "softmax_all":
+            loss_img = (
+                loss_fn_img(eeg_img_emb, target_img, concept_ids)
+                if (loss_fn_img is not None and alpha > 0)
+                else torch.tensor(0.0, device=device)
+            )
+            loss_txt = loss_fn_txt(eeg_txt_emb, target_txt, concept_ids)
+        else:
+            loss_img = loss_fn_img(eeg_img_emb, image_vecs) if (loss_fn_img is not None and alpha > 0) else torch.tensor(0.0, device=device)
+            loss_txt = loss_fn_txt(eeg_txt_emb, text_vecs)
         loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
 
         total_loss += loss.detach()
@@ -441,13 +476,6 @@ def evaluate_concept_retrieval(
     eeg_txt_mean = sums_txt / counts_clamped
     eeg_img_mean = eeg_img_mean / (eeg_img_mean.norm(dim=-1, keepdim=True) + 1e-12)
     eeg_txt_mean = eeg_txt_mean / (eeg_txt_mean.norm(dim=-1, keepdim=True) + 1e-12)
-
-    # Use the dataset's concept targets
-    ds = dataloader.dataset
-    target_img = ds.all_image_vectors.to(device)
-    target_txt = ds.all_text_vectors.to(device)
-    target_img = target_img / (target_img.norm(dim=-1, keepdim=True) + 1e-12)
-    target_txt = target_txt / (target_txt.norm(dim=-1, keepdim=True) + 1e-12)
 
     sim_img = (eeg_img_mean @ target_img.T) if (loss_fn_img is not None and alpha > 0) else None
     sim_txt = eeg_txt_mean @ target_txt.T
@@ -657,11 +685,30 @@ def main(cfg: DictConfig):
         persistent_workers=persistent_workers,
     )
 
+    if loss_mode == "softmax_all" and not bool(cfg.data.get("return_concept_id", False)):
+        raise ValueError("training.loss_mode=softmax_all requires data.return_concept_id=true")
+
     text_only = bool(cfg.training.get("text_only", False))
     alpha = 0.0 if text_only else float(cfg.training.alpha)
 
-    loss_fn_img = None if text_only else InfoNCE(initial_temperature=cfg.training.temperature).to(device)
-    loss_fn_txt = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+    loss_mode = str(cfg.training.get("loss_mode", "infonce")).strip().lower()
+    if loss_mode not in {"infonce", "softmax_all"}:
+        raise ValueError("training.loss_mode must be 'infonce' or 'softmax_all'")
+
+    if loss_mode == "softmax_all":
+        loss_fn_img = None if text_only else ClipSoftmaxLoss(initial_temperature=cfg.training.temperature).to(device)
+        loss_fn_txt = ClipSoftmaxLoss(initial_temperature=cfg.training.temperature).to(device)
+        all_text_targets = train_dataset.all_text_vectors.to(device)
+        all_text_targets = all_text_targets / (all_text_targets.norm(dim=-1, keepdim=True) + 1e-12)
+        all_image_targets = None
+        if not text_only:
+            all_image_targets = train_dataset.all_image_vectors.to(device)
+            all_image_targets = all_image_targets / (all_image_targets.norm(dim=-1, keepdim=True) + 1e-12)
+    else:
+        loss_fn_img = None if text_only else InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+        loss_fn_txt = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+        all_text_targets = None
+        all_image_targets = None
 
     # Keep the same parameter-freezing policy as main.py
     params_backbone_active = []
@@ -771,6 +818,9 @@ def main(cfg: DictConfig):
             sanity_check=bool(cfg.training.get("sanity_check", False)) and epoch == 0,
             sanity_check_once=True,
             rank=rank,
+            loss_mode=loss_mode,
+            all_text_targets=all_text_targets,
+            all_image_targets=all_image_targets,
         )
 
         val_max_steps = int(cfg.training.get("max_val_steps", 200))
@@ -787,6 +837,7 @@ def main(cfg: DictConfig):
             distributed=distributed,
             rank=rank,
             k_values=tuple(int(k) for k in cfg.training.get("k_values", [1, 5, 10])),
+            loss_mode=loss_mode,
         )
         val_loss = float(val_results["loss"])
         val_loss_img = float(val_results["loss_img"])

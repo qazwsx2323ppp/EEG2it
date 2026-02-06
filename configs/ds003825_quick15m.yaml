@@ -29,6 +29,7 @@ data:
   interp_chunk: 128
 
 training:
+  loss_mode: "softmax_all"
   epochs: 20
   batch_size: 32
   num_workers: 0

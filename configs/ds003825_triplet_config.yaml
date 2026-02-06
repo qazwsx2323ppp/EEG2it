@@ -73,6 +73,9 @@ data:
   # exclude_subjects: "sub-01,sub-06,sub-18,sub-23"
 
 training:
+  # Loss: "infonce" (in-batch negatives) or "softmax_all" (full-class softmax over all concepts).
+  # For ds003825 (1854 concepts), softmax_all usually provides a much stronger learning signal.
+  loss_mode: "softmax_all"
   epochs: 50
   batch_size: 64
   learning_rate: 0.0001

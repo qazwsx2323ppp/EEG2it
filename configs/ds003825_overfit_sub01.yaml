@@ -19,6 +19,7 @@ data:
   channel_expand_mode: "repeat"
 
 training:
+  loss_mode: "softmax_all"
   distributed:
     enabled: false
   num_workers: 0

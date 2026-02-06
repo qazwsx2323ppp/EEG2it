@@ -14,6 +14,7 @@ data:
   zscore: false
 
 training:
+  loss_mode: "softmax_all"
   # More trainable capacity
   unfreeze_last_blocks: 8
   unfreeze_patch_embed: true
@@ -28,4 +29,3 @@ model:
   # Remove router noise; focus on semantic head alignment first.
   router_mode: "semantic"
   head_dropout: 0.1
-

@@ -155,8 +155,8 @@ class SpatialMoEEncoder(nn.Module):
 
             # 确认 Decoder 确实被忽略了
             decoder_missing = [k for k in msg.missing_keys if k.startswith('decoder_')]
-            if len(decoder_missing) > 0:
-                print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
+            # if len(decoder_missing) > 0:
+            #     print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
 
             
             # (可选) 冻结主干，只训练后面的 Router 和 Heads，节省显存

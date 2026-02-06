@@ -685,15 +685,15 @@ def main(cfg: DictConfig):
         persistent_workers=persistent_workers,
     )
 
-    if loss_mode == "softmax_all" and not bool(cfg.data.get("return_concept_id", False)):
-        raise ValueError("training.loss_mode=softmax_all requires data.return_concept_id=true")
-
     text_only = bool(cfg.training.get("text_only", False))
     alpha = 0.0 if text_only else float(cfg.training.alpha)
 
     loss_mode = str(cfg.training.get("loss_mode", "infonce")).strip().lower()
     if loss_mode not in {"infonce", "softmax_all"}:
         raise ValueError("training.loss_mode must be 'infonce' or 'softmax_all'")
+
+    if loss_mode == "softmax_all" and not bool(cfg.data.get("return_concept_id", False)):
+        raise ValueError("training.loss_mode=softmax_all requires data.return_concept_id=true")
 
     if loss_mode == "softmax_all":
         loss_fn_img = None if text_only else ClipSoftmaxLoss(initial_temperature=cfg.training.temperature).to(device)

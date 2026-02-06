@@ -49,6 +49,11 @@ data:
   cache_dir: ${data.root}/data/ds003825_cache_paper
   cache_format: "npy"
   lru_subjects: 2
+  # Cache control (recommended for multi-GPU training)
+  cache_build: true
+  cache_write_rank0_only: true
+  cache_lock_timeout_s: 900
+  cache_lock_stale_s: 3600
 
   # 概念级向量（objectnumber 0..1853），推荐先用 text-only 方案：
   #  - out-text 生成到 data/ds003825_concept_text.npy

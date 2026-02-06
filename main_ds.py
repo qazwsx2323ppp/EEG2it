@@ -368,7 +368,10 @@ def compute_retrieval_metrics(similarity_matrix: torch.Tensor, k_values=(1, 5, 1
     negative_sim = similarity_matrix[mask].mean().item()
     metrics["mean_positive_similarity"] = positive_sim
     metrics["mean_negative_similarity"] = negative_sim
-    metrics["separation_ratio"] = positive_sim / (negative_sim + 1e-8)
+    metrics["mean_similarity_gap"] = positive_sim - negative_sim
+    # Use abs(neg) to avoid sign-flips when the average negative similarity is close to 0.
+    # (The ratio is only a rough diagnostic; prefer the gap for stability.)
+    metrics["separation_ratio"] = positive_sim / (abs(negative_sim) + 1e-8)
     return metrics
 
 
@@ -387,6 +390,8 @@ def evaluate_concept_retrieval(
     rank: int,
     k_values=(1, 5, 10),
     loss_mode: str = "infonce",
+    desc: str = "Validation",
+    show_progress: bool = True,
 ):
     """
     Evaluate by averaging EEG embeddings per concept id and computing retrieval against concept targets.
@@ -411,7 +416,7 @@ def evaluate_concept_retrieval(
 
     loss_mode_l = str(loss_mode or "infonce").strip().lower()
 
-    for batch in tqdm(dataloader, desc="Validation", disable=rank != 0):
+    for batch in tqdm(dataloader, desc=desc, disable=(rank != 0) or (not show_progress)):
         if _dist_any_stop(device):
             raise KeyboardInterrupt()
         eeg_signals, image_vecs, text_vecs, concept_ids = _to_device(batch, device)
@@ -558,6 +563,20 @@ def check_parameter_updates(model):
     return {"trainable_count": total_trainable, "frozen_count": total_frozen, "trainable_ratio": total_trainable / (total_trainable + total_frozen)}
 
 
+def _chance_at_k(k: int, present: int) -> float:
+    if present <= 0:
+        return 0.0
+    return min(1.0, float(k) / float(present))
+
+
+def _fmt_topk(metrics: dict, ks=(1, 5, 10)) -> str:
+    parts = []
+    for k in ks:
+        key = f"top_{k}_accuracy"
+        if key in metrics:
+            parts.append(f"@{k}={metrics[key]*100:.2f}%")
+    return " ".join(parts)
+
 @hydra.main(version_base=None, config_path="configs", config_name="ds003825_triplet_config")
 def main(cfg: DictConfig):
     torch.backends.cudnn.benchmark = True
@@ -684,6 +703,34 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
     )
+
+    # Optional: lightweight train-split evaluation (concept-mean retrieval) to distinguish
+    # "can't fit train" vs "fits train but doesn't generalize". Keep it cheap by default.
+    eval_train = bool(cfg.training.get("eval_train", True))
+    train_eval_steps = cfg.training.get("train_eval_steps", 20)
+    train_eval_steps = int(train_eval_steps) if train_eval_steps not in (None, "", 0) else None
+
+    train_eval_loader = None
+    if eval_train:
+        if distributed:
+            train_eval_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
+            )
+        else:
+            train_eval_sampler = None
+        train_eval_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.training.batch_size,
+            shuffle=False,
+            sampler=train_eval_sampler,
+            num_workers=cfg.training.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
 
     text_only = bool(cfg.training.get("text_only", False))
     alpha = 0.0 if text_only else float(cfg.training.alpha)
@@ -839,6 +886,27 @@ def main(cfg: DictConfig):
             k_values=tuple(int(k) for k in cfg.training.get("k_values", [1, 5, 10])),
             loss_mode=loss_mode,
         )
+
+        train_eval_results = None
+        if train_eval_loader is not None:
+            k_values = tuple(int(k) for k in cfg.training.get("k_values", [1, 5, 10]))
+            train_eval_results = evaluate_concept_retrieval(
+                model=model,
+                dataloader=train_eval_loader,
+                loss_fn_img=loss_fn_img,
+                loss_fn_txt=loss_fn_txt,
+                device=device,
+                alpha=float(alpha),
+                max_steps=train_eval_steps,
+                num_concepts=int(cfg.data.get("num_concepts", 1854)),
+                embedding_dim=int(cfg.model.embedding_dim),
+                distributed=distributed,
+                rank=rank,
+                k_values=k_values,
+                loss_mode=loss_mode,
+                desc="TrainEval",
+                show_progress=False,
+            )
         val_loss = float(val_results["loss"])
         val_loss_img = float(val_results["loss_img"])
         val_loss_txt = float(val_results["loss_txt"])
@@ -856,6 +924,7 @@ def main(cfg: DictConfig):
                     "loss_text": train_loss_txt,
                     "steps": steps,
                 },
+                "train_eval": None,
                 "val": {
                     "loss_total": val_loss,
                     "loss_image": val_loss_img,
@@ -869,6 +938,16 @@ def main(cfg: DictConfig):
                 "selection_metric": selection_metric,
                 "selection_mode": selection_mode,
             }
+            if train_eval_results is not None:
+                epoch_metrics["train_eval"] = {
+                    "loss_total": float(train_eval_results["loss"]),
+                    "loss_image": float(train_eval_results["loss_img"]),
+                    "loss_text": float(train_eval_results["loss_txt"]),
+                    "steps": int(train_eval_results.get("steps", 0)),
+                    "present_concepts": int(train_eval_results.get("present_concepts", 0)),
+                    "img_metrics": train_eval_results["img_metrics"],
+                    "txt_metrics": train_eval_results["txt_metrics"],
+                }
             _append_jsonl(metrics_jsonl, epoch_metrics)
 
             if wandb is not None:
@@ -895,34 +974,58 @@ def main(cfg: DictConfig):
                 )
 
             if bool(cfg.training.get("print_epoch_losses", True)):
+                k_values = tuple(int(k) for k in cfg.training.get("k_values", [1, 5, 10]))
+
                 present_concepts = int(val_results.get("present_concepts", 0) or 0)
-                chance_top1 = (1.0 / present_concepts) if present_concepts > 0 else 0.0
+                chance_k = {k: _chance_at_k(k, present_concepts) for k in k_values}
+
                 txt_pos = float(val_results["txt_metrics"].get("mean_positive_similarity", 0.0))
                 txt_neg = float(val_results["txt_metrics"].get("mean_negative_similarity", 0.0))
+                txt_gap = float(val_results["txt_metrics"].get("mean_similarity_gap", txt_pos - txt_neg))
                 txt_sep = float(val_results["txt_metrics"].get("separation_ratio", 0.0))
+                val_txt_topk = _fmt_topk(val_results["txt_metrics"], ks=k_values)
+
+                train_eval_str = ""
+                if train_eval_results is not None:
+                    tr_present = int(train_eval_results.get("present_concepts", 0) or 0)
+                    tr_chance1 = _chance_at_k(1, tr_present)
+                    tr_txt_pos = float(train_eval_results["txt_metrics"].get("mean_positive_similarity", 0.0))
+                    tr_txt_neg = float(train_eval_results["txt_metrics"].get("mean_negative_similarity", 0.0))
+                    tr_txt_gap = float(train_eval_results["txt_metrics"].get("mean_similarity_gap", tr_txt_pos - tr_txt_neg))
+                    tr_txt_sep = float(train_eval_results["txt_metrics"].get("separation_ratio", 0.0))
+                    tr_txt_topk = _fmt_topk(train_eval_results["txt_metrics"], ks=k_values)
+                    # Show chance for top-1 only (others can be inferred from present + k).
+                    train_eval_str = (
+                        f" | trainEval txt {tr_txt_topk} "
+                        f"(chance@1={tr_chance1*100:.2f}%, present={tr_present}) "
+                        f"| sim pos={tr_txt_pos:.3f} neg={tr_txt_neg:.3f} gap={tr_txt_gap:.3f} sep={tr_txt_sep:.3f}"
+                    )
                 if text_only:
                     print(
                         f"[epoch {epoch}] "
                         f"train total={train_loss:.4f} txt={train_loss_txt:.4f} | "
                         f"val total={val_loss:.4f} txt={val_loss_txt:.4f} | "
-                        f"val txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% "
-                        f"(chance={chance_top1*100:.2f}%, present={present_concepts}) | "
-                        f"sim pos={txt_pos:.3f} neg={txt_neg:.3f} sep={txt_sep:.3f} | "
+                        f"val txt {val_txt_topk} "
+                        f"(chance@1={_chance_at_k(1, present_concepts)*100:.2f}%, present={present_concepts}) | "
+                        f"sim pos={txt_pos:.3f} neg={txt_neg:.3f} gap={txt_gap:.3f} sep={txt_sep:.3f}"
+                        f"{train_eval_str} | "
                         f"steps={steps}"
                     )
                 else:
                     img_pos = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_positive_similarity", 0.0))
                     img_neg = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_negative_similarity", 0.0))
+                    img_gap = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("mean_similarity_gap", img_pos - img_neg))
                     img_sep = float(0.0 if val_results.get("img_metrics") is None else val_results["img_metrics"].get("separation_ratio", 0.0))
+                    val_img_topk = "" if val_results.get("img_metrics") is None else _fmt_topk(val_results["img_metrics"], ks=k_values)
                     print(
                         f"[epoch {epoch}] "
                         f"train total={train_loss:.4f} img={train_loss_img:.4f} txt={train_loss_txt:.4f} | "
                         f"val total={val_loss:.4f} img={val_loss_img:.4f} txt={val_loss_txt:.4f} | "
-                        f"val img@1={(0.0 if val_results.get('img_metrics') is None else val_results['img_metrics']['top_1_accuracy']*100):.2f}% "
-                        f"txt@1={val_results['txt_metrics']['top_1_accuracy']*100:.2f}% "
-                        f"(chance={chance_top1*100:.2f}%, present={present_concepts}) | "
-                        f"sim txt(pos/neg/sep)={txt_pos:.3f}/{txt_neg:.3f}/{txt_sep:.3f} "
-                        f"img(pos/neg/sep)={img_pos:.3f}/{img_neg:.3f}/{img_sep:.3f} | "
+                        f"val img {val_img_topk} txt {val_txt_topk} "
+                        f"(chance@1={_chance_at_k(1, present_concepts)*100:.2f}%, present={present_concepts}) | "
+                        f"sim txt(pos/neg/gap/sep)={txt_pos:.3f}/{txt_neg:.3f}/{txt_gap:.3f}/{txt_sep:.3f} "
+                        f"img(pos/neg/gap/sep)={img_pos:.3f}/{img_neg:.3f}/{img_gap:.3f}/{img_sep:.3f}"
+                        f"{train_eval_str} | "
                         f"steps={steps}"
                     )
             else:

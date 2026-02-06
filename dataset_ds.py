@@ -515,6 +515,17 @@ class Ds003825TripletDataset(Dataset):
         self.cache_dir = os.path.abspath(str(cache_dir))
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_format = str(_safe_get(cfg_data, "cache_format", "npy")).lower()  # npy | pt
+        if self.cache_format not in {"npy", "pt"}:
+            raise ValueError("cache_format must be one of: npy, pt")
+
+        # Caching/locking behavior (important under DDP).
+        self.cache_lock_timeout_s = float(_safe_get(cfg_data, "cache_lock_timeout_s", 900.0))
+        self.cache_lock_poll_s = float(_safe_get(cfg_data, "cache_lock_poll_s", 0.2))
+        self.cache_lock_stale_s = float(_safe_get(cfg_data, "cache_lock_stale_s", 3600.0))
+        # If True, non-rank0 will not build caches; they only wait for cache files to appear.
+        self.cache_write_rank0_only = bool(_safe_get(cfg_data, "cache_write_rank0_only", True))
+        # If False, fail fast when cache is missing (useful once you prebuilt all caches).
+        self.cache_build = bool(_safe_get(cfg_data, "cache_build", True))
 
         self.subjects = _discover_subjects(self.bids_root)
         # Optional: restrict to a subset of subjects for quick runs.
@@ -590,6 +601,14 @@ class Ds003825TripletDataset(Dataset):
                 os.close(fd)
                 return True
             except FileExistsError:
+                # Best-effort stale lock cleanup (e.g., previous run crashed).
+                try:
+                    age = time.time() - os.path.getmtime(lock_path)
+                    if age > float(self.cache_lock_stale_s):
+                        os.remove(lock_path)
+                        continue
+                except Exception:
+                    pass
                 if (time.time() - start) > timeout_s:
                     return False
                 time.sleep(poll_s)
@@ -628,8 +647,41 @@ class Ds003825TripletDataset(Dataset):
             if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
                 return
 
+        if not self.cache_build:
+            target = paths["pt"] if self.cache_format == "pt" else f"{paths['eeg']} / {paths['concept']}"
+            raise FileNotFoundError(f"Missing cache for {subject}. Expected: {target}")
+
+        # Under DDP, optionally allow only rank0 to build caches to avoid duplicated work / long lock waits.
+        dist_inited = False
+        dist_rank = 0
+        try:
+            import torch.distributed as dist
+
+            dist_inited = dist.is_available() and dist.is_initialized()
+            if dist_inited:
+                dist_rank = int(dist.get_rank())
+        except Exception:
+            dist_inited = False
+
+        if dist_inited and self.cache_write_rank0_only and dist_rank != 0:
+            start = time.time()
+            while True:
+                if self.cache_format == "pt":
+                    if os.path.isfile(paths["pt"]):
+                        return
+                else:
+                    if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]):
+                        return
+                if (time.time() - start) > float(self.cache_lock_timeout_s):
+                    raise TimeoutError(f"Timed out waiting for rank0 cache build for {subject} under {self.cache_dir}")
+                time.sleep(max(0.05, float(self.cache_lock_poll_s)))
+
         lock_path = self._lock_path(subject)
-        got = self._acquire_lock(lock_path)
+        got = self._acquire_lock(
+            lock_path,
+            timeout_s=float(self.cache_lock_timeout_s),
+            poll_s=float(self.cache_lock_poll_s),
+        )
         if not got:
             raise TimeoutError(f"Timed out waiting for cache lock: {lock_path}")
 

@@ -61,6 +61,13 @@ def main():
         help="How to expand from n_channels_epoch to n_channels_out: 'zero' (pad zeros) or 'repeat' (tile channels).",
     )
     ap.add_argument(
+        "--trial-group-by",
+        type=str,
+        default="",
+        help="Optional grouping key for trial splits to reduce temporal leakage: 'none' | 'block' | 'sequence'. "
+        "When set, the cache builder will also write per-epoch group ids as *_tg{mode}_group.npy.",
+    )
+    ap.add_argument(
         "--prune-cezero",
         action="store_true",
         help="Delete any existing cezero .npy cache files under --cache-dir before building.",
@@ -125,6 +132,7 @@ def main():
     n_channels_epoch = int(args.n_channels_epoch if args.n_channels_epoch is not None else cfg_get("data.n_channels_epoch", 64))
     n_channels_out = int(args.n_channels_out if args.n_channels_out is not None else cfg_get("data.n_channels_out", 128))
     channel_expand_mode = str(args.channel_expand_mode or cfg_get("data.channel_expand_mode", "repeat")).strip().lower()
+    trial_group_by = str(args.trial_group_by or cfg_get("data.trial_group_by", "none")).strip().lower()
     n_samples_out = int(args.n_samples_out if args.n_samples_out is not None else cfg_get("data.n_samples_out", 512))
     interp_chunk = int(args.interp_chunk if args.interp_chunk is not None else cfg_get("data.interp_chunk", 256))
 
@@ -188,6 +196,7 @@ def main():
         "channel_expand_mode": channel_expand_mode,
         "n_samples_out": int(n_samples_out),
         "interp_chunk": int(interp_chunk),
+        "trial_group_by": trial_group_by,
         # Build cache only; splits don't matter here.
         "split_by": "subject",
         "subject_split": [1.0, 0.0, 0.0],

@@ -599,11 +599,17 @@ class Ds003825TripletDataset(Dataset):
         )
         if self.cache_format == "pt":
             return {"pt": os.path.join(self.cache_dir, f"{base}.pt")}
-        return {
+        paths = {
             "eeg": os.path.join(self.cache_dir, f"{base}_eeg.npy"),
             "concept": os.path.join(self.cache_dir, f"{base}_concept.npy"),
-            "group": os.path.join(self.cache_dir, f"{base}_group.npy"),
         }
+        # Group ids are only needed for trial-level splits when we want to split by block/sequence
+        # to reduce temporal leakage. Keep them in a separate file so changing trial_group_by does
+        # not invalidate the large EEG cache.
+        if self.trial_group_by not in {"", "none"}:
+            tg = self.trial_group_by
+            paths["group"] = os.path.join(self.cache_dir, f"{base}_tg{tg}_group.npy")
+        return paths
 
     def _lock_path(self, subject: str) -> str:
         return self._cache_path(subject) + ".lock"
@@ -664,17 +670,23 @@ class Ds003825TripletDataset(Dataset):
 
     def _ensure_subject_cached(self, subject: str) -> None:
         paths = self._cache_paths(subject)
+        need_group = self.trial_group_by not in {"", "none"}
+        group_path = paths.get("group")
         # Fast path
         if self.cache_format == "pt":
             if os.path.isfile(paths["pt"]):
                 return
         else:
-            need_group = self.split_by != "subject" and self.trial_group_by not in {"", "none"}
-            if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or os.path.isfile(paths["group"])):
+            if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or (group_path and os.path.isfile(group_path))):
                 return
 
         if not self.cache_build:
-            target = paths["pt"] if self.cache_format == "pt" else f"{paths['eeg']} / {paths['concept']}"
+            if self.cache_format == "pt":
+                target = paths["pt"]
+            else:
+                target = f"{paths['eeg']} / {paths['concept']}"
+                if need_group:
+                    target = f"{target} / {group_path or '<missing group path>'}"
             raise FileNotFoundError(f"Missing cache for {subject}. Expected: {target}")
 
         # Under DDP, optionally allow only rank0 to build caches to avoid duplicated work / long lock waits.
@@ -696,8 +708,7 @@ class Ds003825TripletDataset(Dataset):
                     if os.path.isfile(paths["pt"]):
                         return
                 else:
-                    need_group = self.split_by != "subject" and self.trial_group_by not in {"", "none"}
-                    if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or os.path.isfile(paths["group"])):
+                    if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or (group_path and os.path.isfile(group_path))):
                         return
                 if (time.time() - start) > float(self.cache_lock_timeout_s):
                     raise TimeoutError(f"Timed out waiting for rank0 cache build for {subject} under {self.cache_dir}")
@@ -718,8 +729,7 @@ class Ds003825TripletDataset(Dataset):
                 if os.path.isfile(paths["pt"]):
                     return
             else:
-                need_group = self.split_by != "subject" and self.trial_group_by not in {"", "none"}
-                if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or os.path.isfile(paths["group"])):
+                if os.path.isfile(paths["eeg"]) and os.path.isfile(paths["concept"]) and (not need_group or (group_path and os.path.isfile(group_path))):
                     return
 
             if _is_rank0():
@@ -756,7 +766,6 @@ class Ds003825TripletDataset(Dataset):
                 group = tensors["group_id"].numpy().astype(np.int32, copy=False) if "group_id" in tensors else None
                 eeg_path = paths["eeg"]
                 concept_path = paths["concept"]
-                group_path = paths.get("group")
                 # NOTE: numpy.save appends ".npy" if the filename doesn't end with it.
                 # Ensure our tmp file names end with ".npy" so os.replace can find them.
                 eeg_tmp = f"{eeg_path}.tmp.{os.getpid()}.npy"
@@ -765,7 +774,7 @@ class Ds003825TripletDataset(Dataset):
                 np.save(concept_tmp, concept)
                 os.replace(eeg_tmp, eeg_path)
                 os.replace(concept_tmp, concept_path)
-                if group is not None and group_path:
+                if need_group and group is not None and group_path:
                     group_tmp = f"{group_path}.tmp.{os.getpid()}.npy"
                     np.save(group_tmp, group)
                     os.replace(group_tmp, group_path)

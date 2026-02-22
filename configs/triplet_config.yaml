@@ -24,47 +24,73 @@ data:
 # 4. 训练参数
 training:
   epochs: 100
-  #data11.8_1
-  #batch_size: 64
   batch_size: 64
   learning_rate: 0.0001
   num_workers: 4
-  device: "cuda" # 'cuda' or 'cpu'
-  #data11.8_1 早停，若在10个epoch中loss没有就停止
+  device: "cuda"
+  
+  # 早停配置
   patience: 10
-  min_delta: 0.01       # <-- 新增：损失改善小于 0.01 不算“改善”
-  #权重衰减 data11.8_0
-  weight_decay: 0.1
+  min_delta: 0.01
+  
+  # 权重衰减
+  weight_decay: 0.15
 
   # 损失函数权重 (alpha * loss_img + (1-alpha) * loss_txt)
   alpha: 0.5
 
   # InfoNCE 损失函数的温度参数
   temperature: 0.2
+  
+  # === 新增配置项 ===
+  
+  # 是否使用 WandB (设为 false 可离线调试)
+  use_wandb: true
+  
+  # 梯度累积步数 (等效增大 batch_size)
+  grad_accum_steps: 1
+  
+  # 学习率预热比例
+  warmup_ratio: 0.1
+  
+  # Sanity Check (首batch诊断)
+  sanity_check: true
+  
+  # Backbone 微调配置
+  unfreeze_last_blocks: 2    # 解冻最后几层 Transformer blocks
+  unfreeze_patch_embed: false # 是否解冻 patch embedding
+  
+  # 模型选择指标 (可选: val/loss_total, val/txt_top1, val/img_top1)
+  selection_metric: "val/loss_total"
+  selection_mode: "min"      # min 或 max
 
 # 5. EEG 编码器模型参数
-#    这些参数来自 EEG-CLIP 仓库，您可以直接使用
 model:
-  model_name: 'eeg_moe'  # 更改名称以区分
+  model_name: 'eeg_moe'
   
-  # [新增] Checkpoint 路径 (请修改为你存放 .pth 的真实路径)
+  # Checkpoint 路径
   pretrained_path: '${data.root}/temp/checkpoint.pth'
 
   # EEG 编码器参数
   n_linear_layers: 1
-  channel_merge: 'linear' # 'linear' or 'attention'
+  channel_merge: 'linear'
   n_heads: 8
 
-  # 确保这个维度与您的 image/text 向量维度一致
-  # e.g., 512 for 'clip-vit-base-patch32'
+  # 嵌入维度 (需与 CLIP 向量维度一致, 512 for 'clip-vit-base-patch32')
   embedding_dim: 512
 
   # EEG 信号参数 (必须与数据匹配)
   n_channels: 128
   n_samples: 440
 
-  # 编码器主干网络 (来自 clip_models.py)
-  encoder_name: 'braindecode_shallow' # 'braindecode_shallow' 或 'braindecode_deep'
+  # 主干网络配置
+  encoder_name: 'braindecode_shallow'
+  
+  # === 新增配置项 ===
+  # Router 模式: moe | semantic | fusion | uniform
+  router_mode: "moe"
+  # Expert Head dropout
+  head_dropout: 0.5
 
 # --- 新增：基于拓扑的分区专家配置 ---
   # 请使用 Python 列表格式填入对应的通道索引 (0-127)

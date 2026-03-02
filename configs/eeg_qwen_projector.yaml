@@ -1,0 +1,88 @@
+# configs/eeg_qwen_projector.yaml
+#
+# Stage-2: train Qwen2.5-Omni EEG projector (512 -> thinker_hidden) with teacher forcing.
+# Pipeline target: EEG -> prompt/description -> Stable Diffusion.
+
+defaults:
+  - _self_
+
+data:
+  root: ${hydra:runtime.cwd}
+  split_index: 0
+  eeg_path: ${data.root}/data/EEG_data/eeg_55_95_std.pth
+  image_vec_path: ${data.root}/data/image_vectors_aligned.npy
+  text_vec_path: ${data.root}/data/text_vectors_aligned.npy
+  splits_path: ${data.root}/data/EEG_data/block_splits_by_image_all.pth
+  return_target_id: true
+  # If your EEG items contain 'caption'/'text'/'prompt', enable this to use them as supervision.
+  return_caption: true
+
+stage1:
+  # Path to your trained EEG encoder weights (best_eeg_encoder.pth from main.py)
+  ckpt_path: ${oc.env:EEG_ENCODER_CKPT,${data.root}/best_eeg_encoder.pth}
+  model:
+    n_channels: 128
+    n_samples: 512
+    embedding_dim: 512
+    pretrained_path: ${oc.env:DREAMDIFF_CKPT,${data.root}/temp/checkpoint.pth}
+    router_mode: "moe"
+    head_dropout: 0.5
+
+qwen:
+  # Folder containing modeling_qwen2_5_omni_low_VRAM_mode.py (added to sys.path)
+  low_vram_dir: eegtxtimgaes/Qwen2.5-Omni-main/low-VRAM-mode
+  # Local Qwen2.5-Omni model folder (HF-style), must exist.
+  model_dir: ${oc.env:QWEN_OMNI_DIR,""}
+  tokenizer_kwargs:
+    trust_remote_code: true
+    local_files_only: true
+  from_pretrained_kwargs:
+    trust_remote_code: true
+    local_files_only: true
+    torch_dtype: "auto"
+
+prompt:
+  eeg_token: "<EEG>"
+  instruction: "Generate a concise Stable Diffusion prompt for the image described by the brain signal."
+  # Supervision target template. Uses: {caption}, {target_id}
+  target_template: "{caption}"
+  max_length: 160
+
+training:
+  device: "cuda"
+  seed: 42
+  epochs: 3
+  batch_size: 2
+  eval_batch_size: 2
+  num_workers: 2
+  lr: 0.0001
+  weight_decay: 0.0
+  grad_accum_steps: 8
+  amp: true
+  log_every: 20
+  # Model selection for saving best projector
+  selection_metric: "eval/clip_hit1"
+  selection_mode: "max"
+  min_delta: 0.0
+  # Set >0 to cap total steps for quick tests
+  max_train_steps: 0
+
+eval:
+  enabled: true
+  max_batches: 4
+  max_new_tokens: 64
+  instruction: "Describe the image as a short Stable Diffusion prompt."
+  retrieval:
+    # If full=true, compare against all target text vectors (slower but accurate).
+    # If full=false and num_candidates>0, evaluate against a subset that always includes GT ids.
+    full: false
+    num_candidates: 2048
+  clip:
+    enabled: true
+    model: "openai/clip-vit-base-patch32"
+    # Set true only if you can download weights (requires internet).
+    allow_download: false
+
+hydra:
+  run:
+    dir: outputs_stage2/${now:%Y-%m-%d}/${now:%H-%M-%S}

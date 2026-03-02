@@ -341,6 +341,8 @@ class TripletDataset(Dataset):
         self.return_target_id = bool(_safe_getattr(cfg_data, "return_target_id", False)) or bool(
             _safe_getattr(cfg_data, "return_concept_id", False)
         )
+        # Whether to return raw caption/text (if present in the EEG items).
+        self.return_caption = bool(_safe_getattr(cfg_data, "return_caption", False))
 
         # ---- ds003825 (BIDS) backend ----
         # 用法：把 cfg.data.eeg_path 指向 BIDS 根目录（包含 dataset_description.json），并提供 concept 级别向量：
@@ -584,7 +586,12 @@ class TripletDataset(Dataset):
 
             image_vector = self.all_image_vectors[concept]
             text_vector = self.all_text_vectors[concept]
+            raw_text = ""
+            if getattr(self, "return_caption", False):
+                raw_text = ""
             if getattr(self, "return_concept_id", False) or getattr(self, "return_target_id", False):
+                if getattr(self, "return_caption", False):
+                    return eeg_signal, image_vector, text_vector, concept, raw_text
                 return eeg_signal, image_vector, text_vector, concept
             return eeg_signal, image_vector, text_vector
 
@@ -644,6 +651,9 @@ class TripletDataset(Dataset):
         text_vector = self.all_text_vectors[main_image_index]
 
         if getattr(self, "return_target_id", False):
+            if getattr(self, "return_caption", False):
+                raw_text = eeg_item_dict.get('caption') or eeg_item_dict.get('text') or eeg_item_dict.get('prompt') or ""
+                return eeg_signal, image_vector, text_vector, int(main_image_index), str(raw_text)
             return eeg_signal, image_vector, text_vector, int(main_image_index)
 
         return eeg_signal, image_vector, text_vector

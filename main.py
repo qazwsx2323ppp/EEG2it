@@ -24,7 +24,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 # 导入本地代码
 from models.clip_models import SpatialMoEEncoder
-from utils.loss_methods import InfoNCE
+from utils.loss_methods import ClipSoftmaxLoss, InfoNCE
 from dataset import TripletDataset
 
 # 设置 PyTorch 以获得更好的性能
@@ -108,18 +108,42 @@ def _get_metric_from_val(val_results: dict, metric: str) -> float:
     if metric in {"val/loss_total", "loss", "val_loss"}:
         return float(val_results["loss"])
     if metric == "val/txt_top1":
-        return float(val_results["txt_metrics"]["top_1_accuracy"])
+        return float(val_results.get("txt_metrics", {}).get("top_1_accuracy", 0.0))
     if metric == "val/txt_top5":
-        return float(val_results["txt_metrics"]["top_5_accuracy"])
+        return float(val_results.get("txt_metrics", {}).get("top_5_accuracy", 0.0))
+    if metric == "val/txt_top10":
+        return float(val_results.get("txt_metrics", {}).get("top_10_accuracy", 0.0))
     if metric == "val/img_top1":
-        return float(val_results["img_metrics"]["top_1_accuracy"])
+        return float(val_results.get("img_metrics", {}).get("top_1_accuracy", 0.0))
     if metric == "val/img_top5":
-        return float(val_results["img_metrics"]["top_5_accuracy"])
+        return float(val_results.get("img_metrics", {}).get("top_5_accuracy", 0.0))
+    if metric == "val/img_top10":
+        return float(val_results.get("img_metrics", {}).get("top_10_accuracy", 0.0))
     return float(val_results["loss"])
 
 
+def _format_topk(metrics: dict, k_values) -> str:
+    parts = []
+    for k in k_values:
+        key = f"top_{int(k)}_accuracy"
+        if key in metrics:
+            parts.append(f"{metrics[key] * 100:.2f}%")
+    return " / ".join(parts) if parts else "N/A"
+
+
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return x
+
+
 def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, device, alpha, scaler, scheduler, 
-                    grad_accum_steps=1, sanity_check=False):
+                    grad_accum_steps=1, sanity_check=False,
+                    loss_mode: str = "infonce",
+                    text_only: bool = False,
+                    all_image_targets=None,
+                    all_text_targets=None):
     """
     执行一个周期的训练 (支持 AMP、Scheduler、梯度累积和 Sanity Check)
     """
@@ -143,6 +167,7 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
             print("[信号] 检测到停止请求，结束当前 epoch...")
             break
             
+        target_ids = batch[3] if len(batch) >= 4 else None
         eeg_signals, image_vecs, text_vecs = batch[:3]
 
         eeg_signals = eeg_signals.to(device)
@@ -182,9 +207,29 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
                 did_sanity = True
 
             # 计算损失
-            loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
-            loss_txt = loss_fn_txt(eeg_text_embeddings, text_vecs)
-            loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
+            loss_mode_l = str(loss_mode or "infonce").strip().lower()
+            if loss_mode_l == "softmax_all":
+                if target_ids is None:
+                    raise ValueError("loss_mode=softmax_all requires target_id returned by the dataset (set data.return_target_id=true).")
+                if all_text_targets is None:
+                    raise ValueError("loss_mode=softmax_all requires all_text_targets.")
+                loss_txt = loss_fn_txt(eeg_text_embeddings, all_text_targets, target_ids.to(device))
+                if text_only:
+                    loss_img = loss_txt.detach() * 0.0
+                    loss = loss_txt
+                else:
+                    if all_image_targets is None:
+                        raise ValueError("loss_mode=softmax_all (text_only=false) requires all_image_targets.")
+                    loss_img = loss_fn_img(eeg_img_embeddings, all_image_targets, target_ids.to(device))
+                    loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
+            else:
+                loss_txt = loss_fn_txt(eeg_text_embeddings, text_vecs)
+                if text_only:
+                    loss_img = loss_txt.detach() * 0.0
+                    loss = loss_txt
+                else:
+                    loss_img = loss_fn_img(eeg_img_embeddings, image_vecs)
+                    loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
             loss_to_backprop = loss / max(1, grad_accum_steps)
 
         # 混合精度反向传播 (支持梯度累积)
@@ -251,14 +296,15 @@ def compute_retrieval_metrics(
         accuracy = hits.float().mean().item()
         metrics[f"top_{k}_accuracy"] = accuracy
     
-    diag = torch.diagonal(similarity_matrix, 0)
-    positive_sim = diag.mean().item() if diag.numel() > 0 else float("nan")
-
     if qids is not None:
         pos_mask = (qids[:, None] == cids[None, :])
+        pos_vals = similarity_matrix[pos_mask]
+        positive_sim = pos_vals.mean().item() if pos_vals.numel() > 0 else float("nan")
         neg_vals = similarity_matrix[~pos_mask]
         negative_sim = neg_vals.mean().item() if neg_vals.numel() > 0 else float("nan")
     else:
+        diag = torch.diagonal(similarity_matrix, 0)
+        positive_sim = diag.mean().item() if diag.numel() > 0 else float("nan")
         if similarity_matrix.shape[0] == similarity_matrix.shape[1]:
             mask = ~torch.eye(similarity_matrix.shape[0], dtype=torch.bool, device=similarity_matrix.device)
             negative_sim = similarity_matrix[mask].mean().item()
@@ -272,7 +318,19 @@ def compute_retrieval_metrics(
     return metrics
 
 
-def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha):
+def enhanced_validate(
+    model,
+    dataloader,
+    loss_fn_img,
+    loss_fn_txt,
+    device,
+    alpha,
+    k_values=None,
+    loss_mode: str = "infonce",
+    text_only: bool = False,
+    all_image_targets=None,
+    all_text_targets=None,
+):
     """增强的验证函数，包含检索指标"""
     model.eval()
     total_loss_val = 0.0
@@ -301,9 +359,29 @@ def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha
             else:
                 eeg_img_embedding, eeg_txt_embedding = outputs
             
-            loss_img = loss_fn_img(eeg_img_embedding, image_vecs)
-            loss_txt = loss_fn_txt(eeg_txt_embedding, text_vecs)
-            loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
+            loss_mode_l = str(loss_mode or "infonce").strip().lower()
+            if loss_mode_l == "softmax_all":
+                if target_ids is None:
+                    raise ValueError("loss_mode=softmax_all requires target_id returned by the dataset (set data.return_target_id=true).")
+                if all_text_targets is None:
+                    raise ValueError("loss_mode=softmax_all requires all_text_targets.")
+                loss_txt = loss_fn_txt(eeg_txt_embedding, all_text_targets, target_ids.to(device))
+                if text_only:
+                    loss_img = loss_txt.detach() * 0.0
+                    loss = loss_txt
+                else:
+                    if all_image_targets is None:
+                        raise ValueError("loss_mode=softmax_all (text_only=false) requires all_image_targets.")
+                    loss_img = loss_fn_img(eeg_img_embedding, all_image_targets, target_ids.to(device))
+                    loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
+            else:
+                loss_txt = loss_fn_txt(eeg_txt_embedding, text_vecs)
+                if text_only:
+                    loss_img = loss_txt.detach() * 0.0
+                    loss = loss_txt
+                else:
+                    loss_img = loss_fn_img(eeg_img_embedding, image_vecs)
+                    loss = (alpha * loss_img) + ((1 - alpha) * loss_txt)
             
             total_loss_val += loss.item()
             total_loss_val_img += loss_img.item()
@@ -322,15 +400,22 @@ def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha
     all_target_txt = torch.cat(all_target_txt_embeddings, dim=0).to(device)
     target_ids_tensor = torch.cat(all_target_ids, dim=0).to(device) if all_target_ids else None
     
-    img_metrics = compute_retrieval_metrics(
-        all_eeg_img,
-        all_target_img,
-        query_ids=target_ids_tensor,
-        candidate_ids=target_ids_tensor,
-    )
+    if k_values is None:
+        k_values = [1, 5, 10]
+
+    img_metrics = {}
+    if not text_only:
+        img_metrics = compute_retrieval_metrics(
+            all_eeg_img,
+            all_target_img,
+            k_values=k_values,
+            query_ids=target_ids_tensor,
+            candidate_ids=target_ids_tensor,
+        )
     txt_metrics = compute_retrieval_metrics(
         all_eeg_txt,
         all_target_txt,
+        k_values=k_values,
         query_ids=target_ids_tensor,
         candidate_ids=target_ids_tensor,
     )
@@ -343,7 +428,7 @@ def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha
         'loss': avg_loss_val,
         'loss_img': avg_loss_val_img,
         'loss_txt': avg_loss_val_txt,
-        'img_metrics': img_metrics,
+        'img_metrics': img_metrics or {},
         'txt_metrics': txt_metrics
     }
 
@@ -459,14 +544,25 @@ def main(cfg: DictConfig):
     test_loader = DataLoader(test_dataset, batch_size=cfg.training.batch_size, shuffle=False,
                              num_workers=cfg.training.num_workers, pin_memory=True)
 
+    loss_mode = str(cfg.training.get("loss_mode", "infonce")).strip().lower()
+    text_only = bool(cfg.training.get("text_only", False))
+    if text_only:
+        print("[配置] text_only=true：将以文本分支为主（仅优化 EEG→Text 对齐）。")
+
     # 初始化损失函数
-    loss_fn_img = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
-    loss_fn_txt = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+    if loss_mode == "softmax_all":
+        loss_fn_txt = ClipSoftmaxLoss(initial_temperature=cfg.training.temperature).to(device)
+        loss_fn_img = None if text_only else ClipSoftmaxLoss(initial_temperature=cfg.training.temperature).to(device)
+    else:
+        loss_fn_txt = InfoNCE(initial_temperature=cfg.training.temperature).to(device)
+        loss_fn_img = None if text_only else InfoNCE(initial_temperature=cfg.training.temperature).to(device)
 
     # 参数分组 - 可配置的 Backbone 解冻
     params_backbone_active = []
     params_head = []
-    loss_params = list(loss_fn_img.parameters()) + list(loss_fn_txt.parameters())
+    loss_params = list(loss_fn_txt.parameters())
+    if loss_fn_img is not None:
+        loss_params += list(loss_fn_img.parameters())
     
     unfreeze_last_blocks = int(cfg.training.get("unfreeze_last_blocks", 2))
     unfreeze_patch_embed = bool(cfg.training.get("unfreeze_patch_embed", False))
@@ -539,12 +635,30 @@ def main(cfg: DictConfig):
 
     # 训练配置
     print("开始训练...")
+
+    k_values = list(cfg.training.get("k_values", [1, 5, 10]))
+
+    # For softmax_all, keep full target matrices on device for efficient logits.
+    all_image_targets = None
+    all_text_targets = None
+    if loss_mode == "softmax_all":
+        all_text_targets = getattr(train_loader.dataset, "all_text_vectors", None)
+        if all_text_targets is None:
+            raise ValueError("loss_mode=softmax_all requires dataset.all_text_vectors")
+        all_text_targets = all_text_targets.to(device)
+        if not text_only:
+            all_image_targets = getattr(train_loader.dataset, "all_image_vectors", None)
+            if all_image_targets is None:
+                raise ValueError("loss_mode=softmax_all requires dataset.all_image_vectors")
+            all_image_targets = all_image_targets.to(device)
     
     # 模型选择配置
     selection_metric = str(cfg.training.get("selection_metric", "val/loss_total"))
     selection_mode = str(cfg.training.get("selection_mode", "min")).lower()
     best_score = float("-inf") if selection_mode == "max" else float("inf")
     best_epoch = -1
+    best_val_snapshot = None
+    best_model_path = None
     
     patience = cfg.training.get("patience", cfg.training.epochs) 
     min_delta = cfg.training.get("min_delta", 0.0)
@@ -556,11 +670,25 @@ def main(cfg: DictConfig):
             model, train_loader, optimizer, loss_fn_img, loss_fn_txt, device, 
             cfg.training.alpha, scaler, scheduler, 
             grad_accum_steps=grad_accum_steps,
-            sanity_check=(sanity_check and epoch == 0)
+            sanity_check=(sanity_check and epoch == 0),
+            loss_mode=loss_mode,
+            text_only=text_only,
+            all_image_targets=all_image_targets,
+            all_text_targets=all_text_targets,
         )
 
         val_results = enhanced_validate(
-            model, val_loader, loss_fn_img, loss_fn_txt, device, cfg.training.alpha
+            model,
+            val_loader,
+            loss_fn_img,
+            loss_fn_txt,
+            device,
+            cfg.training.alpha,
+            k_values=k_values,
+            loss_mode=loss_mode,
+            text_only=text_only,
+            all_image_targets=all_image_targets,
+            all_text_targets=all_text_targets,
         )
 
         avg_loss_val = val_results['loss']
@@ -576,17 +704,22 @@ def main(cfg: DictConfig):
         print(f"Epoch {epoch + 1}/{cfg.training.epochs} | LR: {current_lr:.6f}")
         print(f"{'='*70}")
         
+        print(f"\n[图像检索效果]")
+        if img_metrics:
+            print(f"  Top-{('/'.join(str(int(k)) for k in k_values))}: {_format_topk(img_metrics, k_values)}")
+            print(f"  正/负相似度: {img_metrics.get('mean_positive_similarity', float('nan')):.4f} / {img_metrics.get('mean_negative_similarity', float('nan')):.4f}")
+            print(f"  分离比(正/负): {img_metrics.get('separation_ratio', float('nan')):.4f}")
+        else:
+            print("  (text_only=true 已跳过图像检索指标)")
+        
+        print(f"\n[文本检索效果]")
+        print(f"  Top-{('/'.join(str(int(k)) for k in k_values))}: {_format_topk(txt_metrics, k_values)}")
+        print(f"  正/负相似度: {txt_metrics.get('mean_positive_similarity', float('nan')):.4f} / {txt_metrics.get('mean_negative_similarity', float('nan')):.4f}")
+        print(f"  分离比(正/负): {txt_metrics.get('separation_ratio', float('nan')):.4f}")
+
         print(f"\n[损失指标]")
         print(f"  训练损失: {avg_loss:.4f} (图像: {avg_loss_img:.4f}, 文本: {avg_loss_txt:.4f})")
         print(f"  验证损失: {avg_loss_val:.4f} (图像: {avg_loss_val_img:.4f}, 文本: {avg_loss_val_txt:.4f})")
-        
-        print(f"\n[图像检索效果]")
-        print(f"  Top-1/5/10: {img_metrics['top_1_accuracy']*100:.2f}% / {img_metrics['top_5_accuracy']*100:.2f}% / {img_metrics['top_10_accuracy']*100:.2f}%")
-        print(f"  正/负相似度: {img_metrics['mean_positive_similarity']:.4f} / {img_metrics['mean_negative_similarity']:.4f}")
-        
-        print(f"\n[文本检索效果]")
-        print(f"  Top-1/5/10: {txt_metrics['top_1_accuracy']*100:.2f}% / {txt_metrics['top_5_accuracy']*100:.2f}% / {txt_metrics['top_10_accuracy']*100:.2f}%")
-        print(f"  正/负相似度: {txt_metrics['mean_positive_similarity']:.4f} / {txt_metrics['mean_negative_similarity']:.4f}")
         
         print(f"{'='*70}\n")
 
@@ -613,10 +746,10 @@ def main(cfg: DictConfig):
             "val_loss_total": avg_loss_val,
             "val_loss_image": avg_loss_val_img,
             "val_loss_text": avg_loss_val_txt,
-            "val_img_top1": img_metrics['top_1_accuracy'],
-            "val_img_top5": img_metrics['top_5_accuracy'],
-            "val_txt_top1": txt_metrics['top_1_accuracy'],
-            "val_txt_top5": txt_metrics['top_5_accuracy'],
+            "val_img_top1": (img_metrics.get('top_1_accuracy') if img_metrics else None),
+            "val_img_top5": (img_metrics.get('top_5_accuracy') if img_metrics else None),
+            "val_txt_top1": txt_metrics.get('top_1_accuracy'),
+            "val_txt_top5": txt_metrics.get('top_5_accuracy'),
         }
         if avg_weights:
             log_dict.update(avg_weights)
@@ -636,13 +769,30 @@ def main(cfg: DictConfig):
             else:
                 model_path = os.path.join(run_dir, "best_eeg_encoder.pth")
             torch.save(model.state_dict(), model_path)
+            best_model_path = model_path
+            best_val_snapshot = {
+                "epoch": int(epoch),
+                "learning_rate": _safe_float(current_lr),
+                "train": {"loss_total": _safe_float(avg_loss), "loss_image": _safe_float(avg_loss_img), "loss_text": _safe_float(avg_loss_txt)},
+                "val": {
+                    "loss_total": _safe_float(avg_loss_val),
+                    "loss_image": _safe_float(avg_loss_val_img),
+                    "loss_text": _safe_float(avg_loss_val_txt),
+                    "img_metrics": {k: _safe_float(v) for k, v in dict(img_metrics).items()},
+                    "txt_metrics": {k: _safe_float(v) for k, v in dict(txt_metrics).items()},
+                },
+                "selection_metric": str(selection_metric),
+                "selection_mode": str(selection_mode),
+                "selection_score": _safe_float(score),
+                "k_values": [int(k) for k in k_values],
+            }
             print(f"模型已保存到: {model_path} ({selection_metric}={score:.6f})")
             epochs_no_improve = 0 
         else:
             epochs_no_improve += 1 
 
         if epochs_no_improve >= patience:
-            print(f"验证指标连续 {patience} 个 epoch 没有改善，触发 Early Stopping。")
+            print(f"验证指标连续 {patience} 个 epoch 没有改善，触发 Early Stopping。（best {selection_metric}={best_score:.6f}）")
             break
 
         # 检查是否请求停止
@@ -656,24 +806,76 @@ def main(cfg: DictConfig):
         "best_score": best_score,
         "selection_metric": selection_metric,
         "selection_mode": selection_mode,
+        "k_values": [int(k) for k in k_values],
+        "best_model_path": best_model_path,
+        "best_val": best_val_snapshot,
         "run_dir": run_dir,
     }
     _write_json(metrics_summary_path, summary)
 
     print("训练完成。")
+    if best_val_snapshot is not None:
+        bm = best_val_snapshot["val"].get("img_metrics", {}) or {}
+        tm = best_val_snapshot["val"]["txt_metrics"]
+        print("\n[最佳验证集指标汇总]")
+        print(f"  best_epoch: {best_epoch + 1} | {selection_metric}={best_score:.6f}")
+        print(f"  best_model: {best_model_path}")
+        print("\n  [图像 Top-k]")
+        if bm:
+            print(f"    Top-{('/'.join(str(int(k)) for k in k_values))}: {_format_topk(bm, k_values)}")
+            print(
+                f"    正/负相似度: {bm.get('mean_positive_similarity', float('nan')):.4f} / {bm.get('mean_negative_similarity', float('nan')):.4f}"
+                f" | 分离比: {bm.get('separation_ratio', float('nan')):.4f}"
+            )
+        else:
+            print("    (text_only=true 已跳过图像检索指标)")
+        print("\n  [文本 Top-k]")
+        print(f"    Top-{('/'.join(str(int(k)) for k in k_values))}: {_format_topk(tm, k_values)}")
+        print(
+            f"    正/负相似度: {tm.get('mean_positive_similarity', float('nan')):.4f} / {tm.get('mean_negative_similarity', float('nan')):.4f}"
+            f" | 分离比: {tm.get('separation_ratio', float('nan')):.4f}"
+        )
+        print("\n  [Loss（辅助）]")
+        print(f"    val_loss_total: {best_val_snapshot['val']['loss_total']:.4f} (img: {best_val_snapshot['val']['loss_image']:.4f}, txt: {best_val_snapshot['val']['loss_text']:.4f})")
     
     # 测试集评估
     print("[测试集评估]")
-    avg_loss_test, avg_loss_test_img, avg_loss_test_txt = validate(
-        model, test_loader, loss_fn_img, loss_fn_txt, device, cfg.training.alpha
+    if best_model_path and os.path.isfile(best_model_path):
+        try:
+            model.load_state_dict(torch.load(best_model_path, map_location=device))
+            print(f"[测试集评估] 已加载最佳模型权重: {best_model_path}")
+        except Exception as e:
+            print(f"[测试集评估] 警告：加载最佳模型失败，将使用当前模型参数继续测试：{e}")
+    test_results = enhanced_validate(
+        model,
+        test_loader,
+        loss_fn_img,
+        loss_fn_txt,
+        device,
+        cfg.training.alpha,
+        k_values=k_values,
+        loss_mode=loss_mode,
+        text_only=text_only,
+        all_image_targets=all_image_targets,
+        all_text_targets=all_text_targets,
     )
-    print(f"Test Total Loss: {avg_loss_test:.4f}")
+    test_img = test_results["img_metrics"]
+    test_txt = test_results["txt_metrics"]
+    print("\n[测试集 Top-k]")
+    print(f"  [图像] Top-{('/'.join(str(int(k)) for k in k_values))}: {_format_topk(test_img, k_values)}")
+    print(f"  [文本] Top-{('/'.join(str(int(k)) for k in k_values))}: {_format_topk(test_txt, k_values)}")
+    print("\n[测试集 Loss（辅助）]")
+    print(f"  test_loss_total: {test_results['loss']:.4f} (img: {test_results['loss_img']:.4f}, txt: {test_results['loss_txt']:.4f})")
     
     if wandb is not None:
         wandb.log({
-            "test_loss_total": avg_loss_test,
-            "test_loss_image": avg_loss_test_img,
-            "test_loss_text": avg_loss_test_txt
+            "test_loss_total": test_results["loss"],
+            "test_loss_image": test_results["loss_img"],
+            "test_loss_text": test_results["loss_txt"],
+            "test_img_top1": test_img.get("top_1_accuracy"),
+            "test_img_top5": test_img.get("top_5_accuracy"),
+            "test_txt_top1": test_txt.get("top_1_accuracy"),
+            "test_txt_top5": test_txt.get("top_5_accuracy"),
         })
         wandb.finish()
 

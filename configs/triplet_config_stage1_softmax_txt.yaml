@@ -1,0 +1,28 @@
+# configs/triplet_config_stage1_softmax_txt.yaml
+#
+# Stage-1 ablation: stronger supervision for EEG encoder
+# - loss_mode=softmax_all (full-class softmax over all target vectors)
+# - text_only=true (optimize EEG→Text alignment first)
+#
+# Run:
+#   python main.py --config-name triplet_config_stage1_softmax_txt
+
+defaults:
+  - triplet_config
+
+data:
+  # Required for softmax_all (needs labels per sample)
+  return_target_id: true
+
+training:
+  loss_mode: "softmax_all"   # infonce | softmax_all
+  text_only: true
+  # Prefer selection by text retrieval when text_only
+  selection_metric: "val/txt_top5"
+  selection_mode: "max"
+  min_delta: 0.0001
+  patience: 20
+  k_values: [1, 5, 10]
+  # Text-only: alpha is ignored, keep for compatibility
+  alpha: 0.0
+

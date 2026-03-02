@@ -20,6 +20,8 @@ data:
     image_vec_path: ${data.root}/data/image_vectors_aligned.npy
     text_vec_path: ${data.root}/data/text_vectors_aligned.npy
     splits_path: ${data.root}/data/EEG_data/block_splits_by_image_all.pth
+    # 返回 target_id 用于更稳健的检索指标计算（避免潜在重复目标时 Top-k 被低估）
+    return_target_id: true
 
 # 4. 训练参数
 training:
@@ -31,7 +33,7 @@ training:
   
   # 早停配置
   patience: 10
-  min_delta: 0.01
+  min_delta: 0.0001
   
   # 权重衰减
   weight_decay: 0.15
@@ -60,9 +62,9 @@ training:
   unfreeze_last_blocks: 2    # 解冻最后几层 Transformer blocks
   unfreeze_patch_embed: false # 是否解冻 patch embedding
   
-  # 模型选择指标 (可选: val/loss_total, val/txt_top1, val/img_top1)
-  selection_metric: "val/loss_total"
-  selection_mode: "min"      # min 或 max
+  # 模型选择指标 (可选: val/loss_total, val/txt_top1, val/txt_top5, val/img_top1, val/img_top5)
+  selection_metric: "val/img_top5"
+  selection_mode: "max"      # min 或 max
 
 # 5. EEG 编码器模型参数
 model:

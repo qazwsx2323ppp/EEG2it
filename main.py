@@ -13,6 +13,7 @@ from datetime import datetime
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -142,7 +143,7 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
             print("[信号] 检测到停止请求，结束当前 epoch...")
             break
             
-        eeg_signals, image_vecs, text_vecs = batch
+        eeg_signals, image_vecs, text_vecs = batch[:3]
 
         eeg_signals = eeg_signals.to(device)
         image_vecs = image_vecs.to(device)
@@ -215,22 +216,54 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn_img, loss_fn_txt, devi
     return avg_loss, avg_loss_img, avg_loss_txt, avg_weights
 
 
-def compute_retrieval_metrics(eeg_embeddings, target_embeddings, k_values=[1, 5, 10]):
-    """计算检索准确率"""
+def compute_retrieval_metrics(
+    eeg_embeddings,
+    target_embeddings,
+    k_values=[1, 5, 10],
+    query_ids=None,
+    candidate_ids=None,
+    normalize: bool = True,
+):
+    """计算检索准确率（支持按 target_id 命中，避免重复目标时低估 Top-k）。"""
+    if normalize:
+        eeg_embeddings = F.normalize(eeg_embeddings, p=2, dim=-1)
+        target_embeddings = F.normalize(target_embeddings, p=2, dim=-1)
+
     similarity_matrix = torch.matmul(eeg_embeddings, target_embeddings.T)
     _, sorted_indices = torch.sort(similarity_matrix, dim=1, descending=True)
-    correct_labels = torch.arange(similarity_matrix.shape[0], device=similarity_matrix.device)
+
+    if query_ids is not None:
+        qids = torch.as_tensor(query_ids, device=similarity_matrix.device, dtype=torch.long).view(-1)
+        cids_src = candidate_ids if candidate_ids is not None else query_ids
+        cids = torch.as_tensor(cids_src, device=similarity_matrix.device, dtype=torch.long).view(-1)
+    else:
+        qids = None
+        cids = None
     
     metrics = {}
     for k in k_values:
         top_k_indices = sorted_indices[:, :k]
-        hits = (top_k_indices == correct_labels.unsqueeze(1)).any(dim=1)
+        if qids is None:
+            correct_labels = torch.arange(similarity_matrix.shape[0], device=similarity_matrix.device)
+            hits = (top_k_indices == correct_labels.unsqueeze(1)).any(dim=1)
+        else:
+            hits = (cids[top_k_indices] == qids.unsqueeze(1)).any(dim=1)
         accuracy = hits.float().mean().item()
         metrics[f"top_{k}_accuracy"] = accuracy
     
-    positive_sim = torch.diag(similarity_matrix).mean().item()
-    mask = ~torch.eye(similarity_matrix.shape[0], dtype=torch.bool, device=similarity_matrix.device)
-    negative_sim = similarity_matrix[mask].mean().item()
+    diag = torch.diagonal(similarity_matrix, 0)
+    positive_sim = diag.mean().item() if diag.numel() > 0 else float("nan")
+
+    if qids is not None:
+        pos_mask = (qids[:, None] == cids[None, :])
+        neg_vals = similarity_matrix[~pos_mask]
+        negative_sim = neg_vals.mean().item() if neg_vals.numel() > 0 else float("nan")
+    else:
+        if similarity_matrix.shape[0] == similarity_matrix.shape[1]:
+            mask = ~torch.eye(similarity_matrix.shape[0], dtype=torch.bool, device=similarity_matrix.device)
+            negative_sim = similarity_matrix[mask].mean().item()
+        else:
+            negative_sim = float("nan")
     
     metrics['mean_positive_similarity'] = positive_sim
     metrics['mean_negative_similarity'] = negative_sim
@@ -250,10 +283,12 @@ def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha
     all_eeg_txt_embeddings = []
     all_target_img_embeddings = []
     all_target_txt_embeddings = []
+    all_target_ids = []
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validation"):
-            eeg_signals, image_vecs, text_vecs = batch
+            target_ids = batch[3] if len(batch) >= 4 else None
+            eeg_signals, image_vecs, text_vecs = batch[:3]
             
             eeg_signals = eeg_signals.to(device)
             image_vecs = image_vecs.to(device)
@@ -278,14 +313,27 @@ def enhanced_validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha
             all_eeg_txt_embeddings.append(eeg_txt_embedding.cpu())
             all_target_img_embeddings.append(image_vecs.cpu())
             all_target_txt_embeddings.append(text_vecs.cpu())
+            if target_ids is not None:
+                all_target_ids.append(target_ids.cpu())
     
     all_eeg_img = torch.cat(all_eeg_img_embeddings, dim=0).to(device)
     all_eeg_txt = torch.cat(all_eeg_txt_embeddings, dim=0).to(device)
     all_target_img = torch.cat(all_target_img_embeddings, dim=0).to(device)
     all_target_txt = torch.cat(all_target_txt_embeddings, dim=0).to(device)
+    target_ids_tensor = torch.cat(all_target_ids, dim=0).to(device) if all_target_ids else None
     
-    img_metrics = compute_retrieval_metrics(all_eeg_img, all_target_img)
-    txt_metrics = compute_retrieval_metrics(all_eeg_txt, all_target_txt)
+    img_metrics = compute_retrieval_metrics(
+        all_eeg_img,
+        all_target_img,
+        query_ids=target_ids_tensor,
+        candidate_ids=target_ids_tensor,
+    )
+    txt_metrics = compute_retrieval_metrics(
+        all_eeg_txt,
+        all_target_txt,
+        query_ids=target_ids_tensor,
+        candidate_ids=target_ids_tensor,
+    )
     
     avg_loss_val = total_loss_val / len(dataloader)
     avg_loss_val_img = total_loss_val_img / len(dataloader)
@@ -337,7 +385,7 @@ def validate(model, dataloader, loss_fn_img, loss_fn_txt, device, alpha):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validation"):
-            eeg_signals, image_vecs, text_vecs = batch
+            eeg_signals, image_vecs, text_vecs = batch[:3]
 
             eeg_signals = eeg_signals.to(device)
             image_vecs = image_vecs.to(device)

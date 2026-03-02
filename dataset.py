@@ -1,6 +1,7 @@
 # dataset_2o.py
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 import numpy as np
 import os
@@ -334,6 +335,13 @@ class TripletDataset(Dataset):
         if _is_rank0():
             print(f"正在加载 {mode} 数据（split_index={split_index}）...")
 
+        # Whether to return a stable target id for retrieval metrics.
+        # - ds003825 backend: concept_id (objectnumber)
+        # - default backend: image index
+        self.return_target_id = bool(_safe_getattr(cfg_data, "return_target_id", False)) or bool(
+            _safe_getattr(cfg_data, "return_concept_id", False)
+        )
+
         # ---- ds003825 (BIDS) backend ----
         # 用法：把 cfg.data.eeg_path 指向 BIDS 根目录（包含 dataset_description.json），并提供 concept 级别向量：
         #   - cfg.data.image_vec_path / cfg.data.text_vec_path: shape [1854, D]
@@ -349,7 +357,7 @@ class TripletDataset(Dataset):
             target_channels = int(_safe_getattr(cfg_data, "target_channels", 128) or 128)
             zscore = bool(_safe_getattr(cfg_data, "zscore", False))
             zscore_eps = float(_safe_getattr(cfg_data, "zscore_eps", 1e-6))
-            return_concept_id = bool(_safe_getattr(cfg_data, "return_concept_id", False))
+            return_concept_id = bool(_safe_getattr(cfg_data, "return_concept_id", False)) or self.return_target_id
 
             allowed_subjects = _safe_getattr(cfg_data, "subjects", None)
             if isinstance(allowed_subjects, str):
@@ -396,6 +404,9 @@ class TripletDataset(Dataset):
 
             self.all_image_vectors = torch.from_numpy(image_np).float()
             self.all_text_vectors = torch.from_numpy(text_np).float()
+            # Normalize targets to unit length so dot-product similarity is comparable across samples.
+            self.all_image_vectors = F.normalize(self.all_image_vectors, p=2, dim=-1)
+            self.all_text_vectors = F.normalize(self.all_text_vectors, p=2, dim=-1)
             self.num_available_vectors = min(len(self.all_image_vectors), len(self.all_text_vectors))
 
             # Splits: prefer explicit splits file; else split by subject deterministically.
@@ -455,6 +466,9 @@ class TripletDataset(Dataset):
 
         self.all_image_vectors = torch.from_numpy(np.load(cfg_data.image_vec_path)).float()
         self.all_text_vectors = torch.from_numpy(np.load(cfg_data.text_vec_path)).float()
+        # Normalize targets to unit length so dot-product similarity is comparable across samples.
+        self.all_image_vectors = F.normalize(self.all_image_vectors, p=2, dim=-1)
+        self.all_text_vectors = F.normalize(self.all_text_vectors, p=2, dim=-1)
         num_available_img_vectors = len(self.all_image_vectors)
         num_available_txt_vectors = len(self.all_text_vectors)
 
@@ -570,7 +584,7 @@ class TripletDataset(Dataset):
 
             image_vector = self.all_image_vectors[concept]
             text_vector = self.all_text_vectors[concept]
-            if getattr(self, "return_concept_id", False):
+            if getattr(self, "return_concept_id", False) or getattr(self, "return_target_id", False):
                 return eeg_signal, image_vector, text_vector, concept
             return eeg_signal, image_vector, text_vector
 
@@ -628,5 +642,8 @@ class TripletDataset(Dataset):
         main_image_index = eeg_item_dict['image']
         image_vector = self.all_image_vectors[main_image_index]
         text_vector = self.all_text_vectors[main_image_index]
+
+        if getattr(self, "return_target_id", False):
+            return eeg_signal, image_vector, text_vector, int(main_image_index)
 
         return eeg_signal, image_vector, text_vector

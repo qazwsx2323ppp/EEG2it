@@ -530,6 +530,23 @@ def main(cfg: DictConfig):
         
     print(">>> 成功初始化 Spatial MoE Encoder")
 
+    # Optional: resume encoder weights from a previous run (e.g., Stage-1 best_eeg_encoder.pth)
+    resume_from = str(cfg.training.get("resume_from", "")).strip()
+    if resume_from:
+        if os.path.isfile(resume_from):
+            try:
+                state = torch.load(resume_from, map_location="cpu")
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                print(f">>> 已加载 resume_from: {resume_from}")
+                if missing:
+                    print(f">>> [resume_from] missing_keys: {len(missing)}")
+                if unexpected:
+                    print(f">>> [resume_from] unexpected_keys: {len(unexpected)}")
+            except Exception as e:
+                print(f"[警告] 加载 resume_from 失败，将从当前初始化继续训练：{e}")
+        else:
+            print(f"[警告] resume_from 文件不存在：{resume_from}")
+
     # 准备数据
     split_index = cfg.data.get("split_index", 0)
 

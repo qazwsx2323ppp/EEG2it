@@ -1,0 +1,32 @@
+# configs/triplet_config_stage1_5_softmax_joint.yaml
+#
+# Stage-1.5: start from Stage-1 (text-only) checkpoint, then jointly train image+text branches
+# to improve overall alignment while keeping text retrieval strong.
+#
+# Run (example):
+#   python main.py --config-name triplet_config_stage1_5_softmax_joint training.resume_from=/path/to/best_eeg_encoder.pth
+
+defaults:
+  - triplet_config
+
+data:
+  # Required for softmax_all (needs labels per sample)
+  return_target_id: true
+
+training:
+  # Resume from Stage-1 best checkpoint (override on CLI or via env)
+  resume_from: ${oc.env:STAGE1_CKPT,""}
+
+  loss_mode: "softmax_all"   # infonce | softmax_all
+  text_only: false
+
+  # Joint loss weighting: make text the main objective, image as auxiliary
+  alpha: 0.2
+
+  # Select/save/early-stop by text Top-5 to avoid hurting text alignment
+  selection_metric: "val/txt_top5"
+  selection_mode: "max"
+  min_delta: 0.0001
+  patience: 20
+  k_values: [1, 5, 10]
+

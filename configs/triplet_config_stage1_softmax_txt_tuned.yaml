@@ -1,0 +1,19 @@
+# configs/triplet_config_stage1_softmax_txt_tuned.yaml
+#
+# Stage-1 tuned (text-only): stronger supervision + better defaults.
+#
+# Run:
+#   python main.py --config-name triplet_config_stage1_softmax_txt_tuned
+
+defaults:
+  - triplet_config_stage1_softmax_txt
+
+training:
+  temperature: 0.07
+  weight_decay: 0.05
+  grad_accum_steps: 4
+  patience: 30
+
+model:
+  head_dropout: 0.2
+

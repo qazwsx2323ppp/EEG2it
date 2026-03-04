@@ -1,0 +1,17 @@
+# configs/triplet_config_stage1_5_softmax_joint_unfreeze.yaml
+#
+# Stage-1.5 (aggressive): additionally unfreeze more backbone capacity.
+# Use after the tuned config plateaus.
+#
+# Run:
+#   python main.py --config-name triplet_config_stage1_5_softmax_joint_unfreeze training.resume_from=/path/to/best_eeg_encoder.pth
+
+defaults:
+  - triplet_config_stage1_5_softmax_joint_tuned
+
+training:
+  # Slightly lower lr when unfreezing more backbone
+  learning_rate: 0.00005
+  unfreeze_patch_embed: true
+  unfreeze_last_blocks: 4
+

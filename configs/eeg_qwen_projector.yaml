@@ -16,6 +16,10 @@ data:
   return_target_id: true
   # If your EEG items contain 'caption'/'text'/'prompt', enable this to use them as supervision.
   return_caption: true
+  # If captions are stored in a separate folder, provide it here.
+  # Default pattern is "{image_id}.txt" and will be formatted with image_id/image/label/subject.
+  captions_dir: ${oc.env:CAPTIONS_DIR,""}
+  captions_pattern: "{image_id}.txt"
 
 stage1:
   # Path to your trained EEG encoder weights (best_eeg_encoder.pth from main.py)

@@ -343,6 +343,9 @@ class TripletDataset(Dataset):
         )
         # Whether to return raw caption/text (if present in the EEG items).
         self.return_caption = bool(_safe_getattr(cfg_data, "return_caption", False))
+        self.captions_dir = str(_safe_getattr(cfg_data, "captions_dir", "") or "").strip()
+        self.captions_pattern = str(_safe_getattr(cfg_data, "captions_pattern", "{image_id}.txt") or "{image_id}.txt")
+        self.captions_encoding = str(_safe_getattr(cfg_data, "captions_encoding", "utf-8") or "utf-8")
 
         # ---- ds003825 (BIDS) backend ----
         # 用法：把 cfg.data.eeg_path 指向 BIDS 根目录（包含 dataset_description.json），并提供 concept 级别向量：
@@ -519,6 +522,31 @@ class TripletDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
+    def _load_caption(self, eeg_item_dict, image_id: int) -> str:
+        raw = eeg_item_dict.get('caption') or eeg_item_dict.get('text') or eeg_item_dict.get('prompt') or ""
+        raw = str(raw) if raw is not None else ""
+        if raw.strip():
+            return raw.strip()
+        if not self.captions_dir:
+            return ""
+        try:
+            fname = self.captions_pattern.format(
+                image_id=int(image_id),
+                image=int(image_id),
+                label=int(eeg_item_dict.get("label", -1)) if isinstance(eeg_item_dict, dict) else -1,
+                subject=int(eeg_item_dict.get("subject", -1)) if isinstance(eeg_item_dict, dict) else -1,
+            )
+        except Exception:
+            fname = f"{int(image_id)}.txt"
+        path = os.path.join(self.captions_dir, fname)
+        if not os.path.isfile(path):
+            return ""
+        try:
+            with open(path, "r", encoding=self.captions_encoding) as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
     def __getitem__(self, idx):
         if getattr(self, "backend", "") == "ds003825":
             import mne
@@ -586,11 +614,9 @@ class TripletDataset(Dataset):
 
             image_vector = self.all_image_vectors[concept]
             text_vector = self.all_text_vectors[concept]
-            raw_text = ""
-            if getattr(self, "return_caption", False):
-                raw_text = ""
             if getattr(self, "return_concept_id", False) or getattr(self, "return_target_id", False):
                 if getattr(self, "return_caption", False):
+                    raw_text = ""
                     return eeg_signal, image_vector, text_vector, concept, raw_text
                 return eeg_signal, image_vector, text_vector, concept
             return eeg_signal, image_vector, text_vector
@@ -652,8 +678,8 @@ class TripletDataset(Dataset):
 
         if getattr(self, "return_target_id", False):
             if getattr(self, "return_caption", False):
-                raw_text = eeg_item_dict.get('caption') or eeg_item_dict.get('text') or eeg_item_dict.get('prompt') or ""
-                return eeg_signal, image_vector, text_vector, int(main_image_index), str(raw_text)
+                raw_text = self._load_caption(eeg_item_dict, int(main_image_index))
+                return eeg_signal, image_vector, text_vector, int(main_image_index), raw_text
             return eeg_signal, image_vector, text_vector, int(main_image_index)
 
         return eeg_signal, image_vector, text_vector

@@ -1,0 +1,23 @@
+# configs/triplet_config_stage1_5_softmax_joint_tuned.yaml
+#
+# Stage-1.5 tuned: based on Stage-1.5 joint softmax_all training, with stronger optimization defaults.
+# Goal: improve txt_top5 while keeping joint alignment learnable.
+#
+# Run (example):
+#   python main.py --config-name triplet_config_stage1_5_softmax_joint_tuned training.resume_from=/path/to/best_eeg_encoder.pth
+
+defaults:
+  - triplet_config_stage1_5_softmax_joint
+
+training:
+  # Softer regularization and CLIP-like temperature often improve retrieval
+  temperature: 0.07
+  weight_decay: 0.05
+  # Increase effective batch (more stable softmax gradients); adjust to fit VRAM
+  grad_accum_steps: 4
+  # Give Top-k more time to improve
+  patience: 30
+
+model:
+  head_dropout: 0.2
+

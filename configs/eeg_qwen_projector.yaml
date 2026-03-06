@@ -36,7 +36,7 @@ qwen:
   # Folder containing modeling_qwen2_5_omni_low_VRAM_mode.py (added to sys.path)
   low_vram_dir: eegtxtimgaes/Qwen2.5-Omni-main/low-VRAM-mode
   # Local Qwen2.5-Omni model folder (HF-style), must exist.
-  model_dir: ${oc.env:QWEN_OMNI_DIR,""}
+  model_dir: /media/wsqlab/data/ctp_file/EEG2it/temp/Qwen2.5-Omni-7B-GPTQ-Int4
   tokenizer_kwargs:
     trust_remote_code: true
     local_files_only: true

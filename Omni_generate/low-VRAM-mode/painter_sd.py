@@ -5,9 +5,17 @@ class StableDiffusionPainter:
     def __init__(self, model_id="runwayml/stable-diffusion-v1-5", device="cuda", torch_dtype=torch.float16):
         self.device = device
         self.dtype = torch_dtype
-        # Use a local path if internet is restricted, or standard model ID
+        # Use a local path if internet is restricted, or standard model ID.
+        # Support loading from a single .ckpt/.safetensors file when no diffusers config dir exists.
         try:
-            self.pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype, safety_checker=None)
+            if isinstance(model_id, str) and model_id.endswith((".ckpt", ".safetensors")):
+                self.pipe = StableDiffusionPipeline.from_single_file(
+                    model_id, torch_dtype=torch_dtype, safety_checker=None
+                )
+            else:
+                self.pipe = StableDiffusionPipeline.from_pretrained(
+                    model_id, torch_dtype=torch_dtype, safety_checker=None
+                )
         except Exception as e:
             print(f"Failed to load Stable Diffusion model: {e}")
             # Fallback or re-raise

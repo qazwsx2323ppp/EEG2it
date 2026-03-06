@@ -1,12 +1,20 @@
 # models/clip_models.py
 
+import os
+import sys
+import math
+import types
+
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+# Ensure repo root is on sys.path so `models.ddpt_model` resolves correctly.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from models.ddpt_model import MAEforEEG
-import math
-import sys
-import types
 
 # ======================= 基础功能模块 =======================
 

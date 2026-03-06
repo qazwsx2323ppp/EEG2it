@@ -1,10 +1,19 @@
 # models/clip_models.py
 
+import os
+import sys
+
 import torch
 from torch import nn
 #from braindecode.models import to_dense_prediction_model
-from models.ddpt_model import MAEforEEG
 import torch.nn.functional as F
+
+# Ensure repo root is on sys.path so `models.ddpt_model` resolves correctly.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from models.ddpt_model import MAEforEEG
 
 
 class SpatialMoEEncoder(nn.Module):

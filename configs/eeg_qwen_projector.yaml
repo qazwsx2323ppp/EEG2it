@@ -18,7 +18,7 @@ data:
   return_caption: true
   # If captions are stored in a separate folder, provide it here.
   # Default pattern is "{image_id}.txt" and will be formatted with image_id/image/label/subject.
-  captions_dir: ${oc.env:CAPTIONS_DIR,""}
+  captions_dir: ${data.root}/data/text_data
   captions_pattern: "{image_id}.txt"
 
 stage1:
@@ -36,7 +36,7 @@ qwen:
   # Folder containing modeling_qwen2_5_omni_low_VRAM_mode.py (added to sys.path)
   low_vram_dir: eegtxtimgaes/Qwen2.5-Omni-main/low-VRAM-mode
   # Local Qwen2.5-Omni model folder (HF-style), must exist.
-  model_dir: /media/wsqlab/data/ctp_file/EEG2it/temp/Qwen2.5-Omni-7B-GPTQ-Int4
+  model_dir: /media/wsqlab/data/ctp_file/EEG2it/temp/Qwen2.5-Omni-7B
   tokenizer_kwargs:
     trust_remote_code: true
     local_files_only: true

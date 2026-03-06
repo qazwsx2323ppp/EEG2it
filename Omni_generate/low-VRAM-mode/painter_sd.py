@@ -2,16 +2,27 @@
 from diffusers import StableDiffusionPipeline
 
 class StableDiffusionPainter:
-    def __init__(self, model_id="runwayml/stable-diffusion-v1-5", device="cuda", torch_dtype=torch.float16):
+    def __init__(
+        self,
+        model_id="runwayml/stable-diffusion-v1-5",
+        device="cuda",
+        torch_dtype=torch.float16,
+        original_config_file=None,
+        torch_load_args=None,
+    ):
         self.device = device
         self.dtype = torch_dtype
         # Use a local path if internet is restricted, or standard model ID.
         # Support loading from a single .ckpt/.safetensors file when no diffusers config dir exists.
         try:
             if isinstance(model_id, str) and model_id.endswith((".ckpt", ".safetensors")):
-                self.pipe = StableDiffusionPipeline.from_single_file(
-                    model_id, torch_dtype=torch_dtype, safety_checker=None
-                )
+                # Some older/PL checkpoints need torch_load_args={"weights_only": False}.
+                kwargs = {"torch_dtype": torch_dtype, "safety_checker": None}
+                if original_config_file:
+                    kwargs["original_config_file"] = original_config_file
+                if torch_load_args:
+                    kwargs["torch_load_args"] = torch_load_args
+                self.pipe = StableDiffusionPipeline.from_single_file(model_id, **kwargs)
             else:
                 self.pipe = StableDiffusionPipeline.from_pretrained(
                     model_id, torch_dtype=torch_dtype, safety_checker=None

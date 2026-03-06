@@ -30,7 +30,22 @@ def main():
     parser.add_argument("--eeg_ckpt", type=str, default=os.environ.get("EEG_ENCODER_CKPT", ""))
     parser.add_argument("--eeg_path", type=str, default=os.environ.get("EEG_TENSOR_PATH", ""))
     parser.add_argument("--prompt", type=str, default=os.environ.get("EEG_PROMPT_TEXT", "a photo of an object"))
-    parser.add_argument("--sd_model", type=str, default=os.environ.get("SD_MODEL_ID", "runwayml/stable-diffusion-v1-5"))
+    parser.add_argument(
+        "--sd_model",
+        type=str,
+        default=os.environ.get(
+            "SD_MODEL_ID",
+            "/media/wsqlab/data/ctp_file/EEG2it/temp/v1-5-pruned.ckpt",
+        ),
+    )
+    parser.add_argument(
+        "--sd_config",
+        type=str,
+        default=os.environ.get(
+            "SD_CONFIG",
+            "/media/wsqlab/data/ctp_file/EEG2it/temp/v1-inference.yaml",
+        ),
+    )
     parser.add_argument("--out", type=str, default=os.environ.get("SD_OUTPUT_PATH", "output_image_sd_eeg.png"))
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -63,7 +78,14 @@ def main():
         emb_img, _, _ = eeg_encoder(eeg)
 
     # 3) SD painter
-    painter = StableDiffusionPainter(model_id=args.sd_model, device=str(device), torch_dtype=torch.float16)
+    torch_load_args = {"weights_only": False} if args.sd_model.endswith(".ckpt") else None
+    painter = StableDiffusionPainter(
+        model_id=args.sd_model,
+        device=str(device),
+        torch_dtype=torch.float16,
+        original_config_file=(args.sd_config or None),
+        torch_load_args=torch_load_args,
+    )
 
     # 4) EEG -> SD projector (untrained by default)
     sd_hidden_size = painter.pipe.text_encoder.config.hidden_size

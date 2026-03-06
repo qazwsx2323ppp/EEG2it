@@ -23,7 +23,7 @@ data:
 
 stage1:
   # Path to your trained EEG encoder weights (best_eeg_encoder.pth from main.py)
-  ckpt_path: ${oc.env:EEG_ENCODER_CKPT,${data.root}/best_eeg_encoder.pth}
+  ckpt_path: ${oc.env:EEG_ENCODER_CKPT,${data.root}/best_fornow.pth}
   model:
     n_channels: 128
     n_samples: 512

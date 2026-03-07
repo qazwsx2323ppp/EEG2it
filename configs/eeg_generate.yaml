@@ -1,0 +1,27 @@
+## EEG -> Prompt -> SD generation config (inference)
+## Use with: python Omni_generate/low-VRAM-mode/demo_min_eeg_to_sd.py --config configs/eeg_generate.yaml
+
+data:
+  eeg_path: /media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/eeg_55_95_std.pth
+  image_vec_path: /media/wsqlab/data/ctp_file/EEG2it/data/image_vectors_aligned.npy
+  text_vec_path: /media/wsqlab/data/ctp_file/EEG2it/data/text_vectors_aligned.npy
+  splits_path: /media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/block_splits_by_image_all.pth
+
+eeg:
+  # Path to trained EEG encoder (stage1)
+  ckpt: /media/wsqlab/data/ctp_file/EEG2it/best_eeg_encoder.pth
+  # Optional: projector for EEG -> SD text space
+  img_proj_ckpt: ""
+
+qwen:
+  low_vram_dir: Omni_generate/low-VRAM-mode
+  model_dir: /media/wsqlab/data/ctp_file/EEG2it/temp/Qwen2.5-Omni-7B
+
+sd:
+  model: /media/wsqlab/data/ctp_file/EEG2it/temp/sd15-diffusers
+  config: ""
+  output: /media/wsqlab/data/ctp_file/EEG2it/output_image_sd_eeg.png
+
+prompt: "a photo of an object"
+device: "cuda"
+seed: 42

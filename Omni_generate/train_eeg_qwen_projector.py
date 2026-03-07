@@ -446,6 +446,21 @@ def main(cfg: DictConfig) -> None:
     if not qwen_kwargs.get("device_map"):
         model = model.to(device)
 
+    # Optional: activation checkpointing to reduce memory
+    if bool(cfg.training.get("grad_checkpointing", False)):
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "config"):
+            try:
+                model.config.use_cache = False
+            except Exception:
+                pass
+        if hasattr(model, "thinker") and hasattr(model.thinker, "config"):
+            try:
+                model.thinker.config.use_cache = False
+            except Exception:
+                pass
+
     # Attach frozen EEG encoder for convenience (optional, used only in eval helpers)
     model.eeg_encoder = eeg_encoder
 

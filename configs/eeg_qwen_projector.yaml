@@ -51,20 +51,21 @@ prompt:
   instruction: "Generate a concise Stable Diffusion prompt for the image described by the brain signal."
   # Supervision target template. Uses: {caption}, {target_id}
   target_template: "{caption}"
-  max_length: 160
+  max_length: 96
 
 training:
   device: "cuda"
   seed: 42
   epochs: 3
-  batch_size: 2
-  eval_batch_size: 2
+  batch_size: 1
+  eval_batch_size: 1
   num_workers: 2
   lr: 0.0001
   weight_decay: 0.0
-  grad_accum_steps: 8
+  grad_accum_steps: 4
   amp: true
   log_every: 20
+  grad_checkpointing: true
   # Model selection for saving best projector
   selection_metric: "eval/clip_hit1"
   selection_mode: "max"
@@ -73,7 +74,7 @@ training:
   max_train_steps: 0
 
 eval:
-  enabled: true
+  enabled: false
   max_batches: 4
   max_new_tokens: 64
   instruction: "Describe the image as a short Stable Diffusion prompt."

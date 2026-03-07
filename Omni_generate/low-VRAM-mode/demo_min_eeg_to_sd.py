@@ -35,16 +35,13 @@ def main():
         type=str,
         default=os.environ.get(
             "SD_MODEL_ID",
-            "/media/wsqlab/data/ctp_file/EEG2it/temp/v1-5-pruned.ckpt",
+            "/media/wsqlab/data/ctp_file/EEG2it/temp/sd15-diffusers",
         ),
     )
     parser.add_argument(
         "--sd_config",
         type=str,
-        default=os.environ.get(
-            "SD_CONFIG",
-            "/media/wsqlab/data/ctp_file/EEG2it/temp/v1-inference.yaml",
-        ),
+        default=os.environ.get("SD_CONFIG", ""),
     )
     parser.add_argument("--out", type=str, default=os.environ.get("SD_OUTPUT_PATH", "output_image_sd_eeg.png"))
     parser.add_argument("--device", type=str, default="cuda")

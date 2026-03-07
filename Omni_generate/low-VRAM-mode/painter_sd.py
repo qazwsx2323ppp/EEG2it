@@ -129,6 +129,15 @@ class StableDiffusionPainter:
             eeg_token = eeg_token * float(eeg_token_scale)
         eeg_token = eeg_token.unsqueeze(1)  # [B, 1, D]
 
+        # Match batch size for CFG (prompt_embeds may be 2*B)
+        if prompt_embeds.shape[0] != eeg_token.shape[0]:
+            if prompt_embeds.shape[0] % eeg_token.shape[0] != 0:
+                raise ValueError(
+                    f"Batch mismatch: prompt_embeds={prompt_embeds.shape[0]}, eeg_token={eeg_token.shape[0]}"
+                )
+            repeat = prompt_embeds.shape[0] // eeg_token.shape[0]
+            eeg_token = eeg_token.repeat(repeat, 1, 1)
+
         prompt_embeds = torch.cat([eeg_token, prompt_embeds], dim=1)
 
         if negative_prompt_embeds is not None:

@@ -9,7 +9,15 @@ from torch.nn import Parameter
 from torch import nn 
 # EEGEncoder not used here; external EEG embeddings are expected
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
+try:
+    from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
+except Exception:
+    from transformers.cache_utils import Cache, DynamicCache
+
+    StaticCache = Cache
+
+    class SlidingWindowCache(Cache):
+        pass
 from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_flash_attention_utils import  is_flash_attn_available

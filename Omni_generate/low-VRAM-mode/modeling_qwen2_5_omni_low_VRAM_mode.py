@@ -1728,7 +1728,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
+            vocab_size = getattr(self.config, "vocab_size", None)
+            if vocab_size is None and hasattr(self.config, "text_config"):
+                vocab_size = getattr(self.config.text_config, "vocab_size", None)
+            if vocab_size is None:
+                vocab_size = logits.shape[-1]
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=vocab_size)
 
         if not return_dict:
             output = (logits,) + outputs

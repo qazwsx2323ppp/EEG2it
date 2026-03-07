@@ -474,6 +474,8 @@ def main(cfg: DictConfig) -> None:
         p.requires_grad = False
     for p in model.eeg_projector.parameters():
         p.requires_grad = True
+    # Keep trainable projector in fp32 to avoid GradScaler unscale errors on fp16 params.
+    model.eeg_projector = model.eeg_projector.to(device=device, dtype=torch.float32)
 
     # Wrap eeg_projector with DDP if distributed
     if is_dist:

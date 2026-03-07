@@ -329,7 +329,7 @@ def _evaluate_generation(
     return result
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="eeg_qwen_projector")
+@hydra.main(version_base=None, config_path="../configs", config_name="eeg_qwen_projector")
 def main(cfg: DictConfig) -> None:
     print("Hydra 配置:\n", OmegaConf.to_yaml(cfg))
 

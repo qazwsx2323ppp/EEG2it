@@ -141,29 +141,26 @@ class SpatialMoEEncoder(nn.Module):
                     new_key = k.replace("mae.", "")
                     new_state_dict[new_key] = v
                     
-            # 4. 如果提取到了参数，进行加载
+            # 4. If we extracted params, load; otherwise warn.
+            missing_keys = []
+            msg = None
             if len(new_state_dict) > 0:
-                print(f">>> 成功提取了 {len(new_state_dict)} 个 EEG Encoder 参数。")
+                print(f">>> Loaded {len(new_state_dict)} EEG Encoder params.")
                 msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-                print(f">>> 权重加载详情: {msg}")
-                
-                ## --- 【修正后的检查逻辑】 ---
-                # 过滤掉所有 decoder 相关的缺失键，因为我们不需要 Decoder
-                missing_keys = [k for k in msg.missing_keys if not k.startswith('decoder_') and not k.startswith('mask_token')]
-            
-            # 打印结果
-            if len(missing_keys) > 0:
-                print(f">>> ⚠️ 注意：部分 Encoder 权重未加载 (Missing Keys): {missing_keys}")
-                # 只有当核心 Encoder 层缺失时才报严重警告
-                if any("blocks" in k for k in missing_keys) or any("patch_embed" in k for k in missing_keys):
-                    print("!!! 严重警告：核心 Encoder Block 缺失！请检查前缀！")
-                else:
-                    print(">>> (这些缺失可能不影响 Encoder 功能，如 head 等)")
+                print(f">>> Load msg: {msg}")
+                missing_keys = [k for k in msg.missing_keys if not k.startswith("decoder_") and not k.startswith("mask_token")]
             else:
-                print(">>> ✅ 完美！所有 Encoder 核心权重均已加载！")
+                print(f">>> Warning: no weights found with prefix '{target_prefix}'.")
+            
+            if msg is not None:
+                if len(missing_keys) > 0:
+                    print(f">>> Warning: missing encoder keys: {missing_keys}")
+                    if any("blocks" in k for k in missing_keys) or any("patch_embed" in k for k in missing_keys):
+                        print("!!! Core encoder blocks missing; check prefix.")
+                else:
+                    print(">>> Encoder core weights loaded.")
 
-            # 确认 Decoder 确实被忽略了
-            decoder_missing = [k for k in msg.missing_keys if k.startswith('decoder_')]
+                decoder_missing = [k for k in msg.missing_keys if k.startswith("decoder_")]
             # if len(decoder_missing) > 0:
             #     print(f">>> 已忽略 {len(decoder_missing)} 个 Decoder 参数 (这是正常的)。")
 

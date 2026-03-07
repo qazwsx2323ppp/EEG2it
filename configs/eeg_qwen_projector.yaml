@@ -28,7 +28,7 @@ stage1:
     n_channels: 128
     n_samples: 512
     embedding_dim: 512
-    pretrained_path: ${oc.env:DREAMDIFF_CKPT,${data.root}/temp/best_fornow.pth}
+    pretrained_path: ${oc.env:DREAMDIFF_CKPT,${data.root}/temp/checkpoint_all.pth}
     router_mode: "moe"
     head_dropout: 0.5
 

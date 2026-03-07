@@ -39,29 +39,25 @@ class StableDiffusionPainter:
         except Exception:
             pass
 
-    def _encode_prompt_embeds(self, prompt, negative_prompt=None, guidance_scale=7.5):
+    def _encode_prompt_embeds(self, prompt, negative_prompt=None, guidance_scale=7.5, reserve_tokens=0):
+        # We encode explicitly to guarantee truncation and allow reserving space
+        # for extra conditioning tokens (e.g., EEG token).
         do_cfg = guidance_scale is not None and guidance_scale > 1.0
-        if hasattr(self.pipe, "_encode_prompt"):
-            out = self.pipe._encode_prompt(
-                prompt=prompt,
-                device=self.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=do_cfg,
-                negative_prompt=negative_prompt,
-            )
-            if isinstance(out, tuple):
-                prompt_embeds, negative_prompt_embeds = out
-            else:
-                prompt_embeds, negative_prompt_embeds = out, None
-            return prompt_embeds, negative_prompt_embeds
-
-        # Fallback for older diffusers
         tokenizer = self.pipe.tokenizer
         text_encoder = self.pipe.text_encoder
+
+        max_len = int(getattr(tokenizer, "model_max_length", 77) or 77)
+        if reserve_tokens:
+            if reserve_tokens >= max_len:
+                raise ValueError(
+                    f"reserve_tokens={reserve_tokens} >= tokenizer.model_max_length={max_len}"
+                )
+            max_len = max_len - int(reserve_tokens)
+
         text_inputs = tokenizer(
             prompt,
             padding="max_length",
-            max_length=tokenizer.model_max_length,
+            max_length=max_len,
             truncation=True,
             return_tensors="pt",
         )
@@ -73,7 +69,7 @@ class StableDiffusionPainter:
             neg_inputs = tokenizer(
                 neg,
                 padding="max_length",
-                max_length=tokenizer.model_max_length,
+                max_length=max_len,
                 truncation=True,
                 return_tensors="pt",
             )
@@ -122,6 +118,7 @@ class StableDiffusionPainter:
             prompt=prompt,
             negative_prompt=negative_prompt,
             guidance_scale=guidance_scale,
+            reserve_tokens=1,
         )
 
         eeg_token = eeg_proj(eeg_img_emb)

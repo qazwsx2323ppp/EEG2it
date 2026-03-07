@@ -948,6 +948,17 @@ class Qwen2_5OmniRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+        if self.rope_type not in ROPE_INIT_FUNCTIONS:
+            # Backward compatibility with older transformers (no "default" key).
+            if "linear" in ROPE_INIT_FUNCTIONS:
+                self.rope_type = "linear"
+            elif "default" in ROPE_INIT_FUNCTIONS:
+                self.rope_type = "default"
+            elif "none" in ROPE_INIT_FUNCTIONS:
+                self.rope_type = "none"
+            else:
+                # Fall back to any available implementation to avoid crash.
+                self.rope_type = next(iter(ROPE_INIT_FUNCTIONS.keys()))
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)

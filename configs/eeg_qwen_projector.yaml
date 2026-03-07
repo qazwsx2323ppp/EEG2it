@@ -43,7 +43,8 @@ qwen:
   from_pretrained_kwargs:
     trust_remote_code: true
     local_files_only: true
-    torch_dtype: "auto"
+    torch_dtype: "float16"
+    low_cpu_mem_usage: true
 
 prompt:
   eeg_token: "<EEG>"

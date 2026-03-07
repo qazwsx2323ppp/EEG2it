@@ -95,6 +95,17 @@ def _ensure_eeg_token(tokenizer, model, eeg_token: str) -> int:
     return eeg_tok_id
 
 
+def _dist_info():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    return world_size, rank, local_rank
+
+
+def _is_rank0(rank: int) -> bool:
+    return rank == 0
+
+
 def _tokenizer_eos_id(tokenizer) -> Optional[int]:
     eos = getattr(tokenizer, "eos_token_id", None)
     if eos is not None:
@@ -331,7 +342,10 @@ def _evaluate_generation(
 
 @hydra.main(version_base=None, config_path="../configs", config_name="eeg_qwen_projector")
 def main(cfg: DictConfig) -> None:
-    print("Hydra 配置:\n", OmegaConf.to_yaml(cfg))
+    world_size, rank, local_rank = _dist_info()
+    is_dist = world_size > 1
+    if not is_dist or _is_rank0(rank):
+        print("Hydra 配置:\n", OmegaConf.to_yaml(cfg))
 
     import torch
     from torch.utils.data import DataLoader
@@ -342,27 +356,50 @@ def main(cfg: DictConfig) -> None:
 
     _set_seed(int(cfg.training.get("seed", 42)))
 
-    device = torch.device(str(cfg.training.get("device", "cuda")))
+    if is_dist:
+        import torch.distributed as dist
+
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(str(cfg.training.get("device", "cuda")))
 
     # ---- Data ----
     split_index = int(cfg.data.get("split_index", 0))
     train_ds = TripletDataset(cfg.data, mode="train", split_index=split_index)
     val_ds = TripletDataset(cfg.data, mode="val", split_index=split_index)
 
+    train_sampler = None
+    if is_dist:
+        from torch.utils.data import DistributedSampler
+
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False,
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg.training.get("batch_size", 2)),
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=int(cfg.training.get("num_workers", 2)),
         pin_memory=True,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=int(cfg.training.get("eval_batch_size", cfg.training.get("batch_size", 2))),
-        shuffle=False,
-        num_workers=int(cfg.training.get("num_workers", 2)),
-        pin_memory=True,
-    )
+
+    val_loader = None
+    if not is_dist or _is_rank0(rank):
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=int(cfg.training.get("eval_batch_size", cfg.training.get("batch_size", 2))),
+            shuffle=False,
+            num_workers=int(cfg.training.get("num_workers", 2)),
+            pin_memory=True,
+        )
 
     # ---- Stage-1 EEG encoder (frozen) ----
     eeg_encoder = SpatialMoEEncoder(
@@ -396,24 +433,43 @@ def main(cfg: DictConfig) -> None:
 
     qwen_kwargs = _to_kwargs(cfg.qwen.get("from_pretrained_kwargs", {}))
     qwen_kwargs = _normalize_torch_dtype(qwen_kwargs)
+
+    if is_dist and "device_map" in qwen_kwargs:
+        if _is_rank0(rank):
+            print("[Stage-2] DDP detected: ignoring device_map to replicate model on each GPU.")
+        qwen_kwargs.pop("device_map", None)
     tok_kwargs = _to_kwargs(cfg.qwen.get("tokenizer_kwargs", {}))
     tokenizer = AutoTokenizer.from_pretrained(qwen_model_dir, **tok_kwargs)
 
     model = qwen_mod.Qwen2_5OmniForConditionalGeneration.from_pretrained(qwen_model_dir, **qwen_kwargs)
-    model = model.to(device)
+    # If device_map is used, Accelerate will place modules automatically.
+    if not qwen_kwargs.get("device_map"):
+        model = model.to(device)
 
     # Attach frozen EEG encoder for convenience (optional, used only in eval helpers)
     model.eeg_encoder = eeg_encoder
 
     eeg_token = str(cfg.prompt.get("eeg_token", "<EEG>"))
     eeg_tok_id = _ensure_eeg_token(tokenizer, model, eeg_token=eeg_token)
-    print(f"[Stage-2] EEG token id: {eeg_tok_id}")
+    if not is_dist or _is_rank0(rank):
+        print(f"[Stage-2] EEG token id: {eeg_tok_id}")
 
     # Freeze everything except eeg_projector
     for p in model.parameters():
         p.requires_grad = False
     for p in model.eeg_projector.parameters():
         p.requires_grad = True
+
+    # Wrap eeg_projector with DDP if distributed
+    if is_dist:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        model.eeg_projector = DDP(
+            model.eeg_projector,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
 
     # Optimizer
     optim = torch.optim.AdamW(
@@ -434,9 +490,10 @@ def main(cfg: DictConfig) -> None:
     metrics_path = out_dir / "stage2_metrics.jsonl"
 
     best_score = float("-inf")
-    best_path = out_dir / "best_eeg_projector.pth"
 
     def _append_metrics(obj: dict[str, Any]) -> None:
+        if is_dist and not _is_rank0(rank):
+            return
         with metrics_path.open("a", encoding="utf-8") as f:
             import json
 
@@ -450,18 +507,24 @@ def main(cfg: DictConfig) -> None:
     warn_no_caption = True
 
     for epoch in range(epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         running = 0.0
         nloss = 0
         optim.zero_grad(set_to_none=True)
 
-        for batch in tqdm(train_loader, desc=f"Stage2 Train (epoch {epoch+1}/{epochs})"):
+        it = train_loader
+        if not is_dist or _is_rank0(rank):
+            it = tqdm(train_loader, desc=f"Stage2 Train (epoch {epoch+1}/{epochs})")
+
+        for batch in it:
             eeg = batch[0].to(device)
             target_ids = batch[3].cpu().tolist() if len(batch) >= 4 else [0] * int(eeg.shape[0])
             captions = batch[4] if len(batch) >= 5 else None
             if captions is None:
-                if warn_no_caption:
-                    print("[Stage-2] 警告：dataset 未返回 caption/text，将使用 target_id 模板生成监督文本（效果通常较差）。")
+                if warn_no_caption and (not is_dist or _is_rank0(rank)):
+                    print("[Stage-2] Warning: dataset did not return caption/text; using target_id template for supervision (usually worse).")
                     warn_no_caption = False
                 captions = ["" for _ in target_ids]
 
@@ -514,19 +577,20 @@ def main(cfg: DictConfig) -> None:
             nloss += 1
             global_step += 1
 
-            if log_every and (global_step % log_every == 0):
+            if log_every and (global_step % log_every == 0) and (not is_dist or _is_rank0(rank)):
                 print(f"[Stage-2] step={global_step} loss={running / max(1, nloss):.4f}")
 
             if max_steps and global_step >= max_steps:
                 break
 
         train_loss = running / max(1, nloss)
-        print(f"[Stage-2] epoch={epoch} train_loss={train_loss:.4f}")
+        if not is_dist or _is_rank0(rank):
+            print(f"[Stage-2] epoch={epoch} train_loss={train_loss:.4f}")
 
         # Eval (optional)
-        all_text_vectors_cpu = getattr(val_loader.dataset, "all_text_vectors", None)
         eval_metrics = {}
-        if bool(cfg.eval.get("enabled", True)):
+        if (not is_dist or _is_rank0(rank)) and val_loader is not None and bool(cfg.eval.get("enabled", True)):
+            all_text_vectors_cpu = getattr(val_loader.dataset, "all_text_vectors", None)
             eval_metrics = _evaluate_generation(
                 cfg=cfg,
                 model=model,
@@ -543,12 +607,14 @@ def main(cfg: DictConfig) -> None:
         selection_mode = str(cfg.training.get("selection_mode", "max")).lower()
         min_delta = float(cfg.training.get("min_delta", 0.0))
 
-        score = float(eval_metrics.get(selection_metric, -train_loss))
-        improved = (score > best_score + min_delta) if selection_mode == "max" else (score < best_score - min_delta)
-        if improved:
-            best_score = score
-            torch.save(model.eeg_projector.state_dict(), best_path)
-            print(f"[Stage-2] 保存 best_eeg_projector 到: {best_path} ({selection_metric}={best_score:.6f})")
+        if not is_dist or _is_rank0(rank):
+            score = float(eval_metrics.get(selection_metric, -train_loss))
+            improved = (score > best_score + min_delta) if selection_mode == "max" else (score < best_score - min_delta)
+            if improved:
+                best_score = score
+                proj = model.eeg_projector.module if hasattr(model.eeg_projector, "module") else model.eeg_projector
+                torch.save(proj.state_dict(), best_path)
+                print(f"[Stage-2] Saved best_eeg_projector to: {best_path} ({selection_metric}={best_score:.6f})")
 
         _append_metrics(
             {
@@ -564,7 +630,14 @@ def main(cfg: DictConfig) -> None:
         if max_steps and global_step >= max_steps:
             break
 
-    print("[Stage-2] 训练完成。")
+    if not is_dist or _is_rank0(rank):
+        print("[Stage-2] Training complete.")
+
+    if is_dist:
+        import torch.distributed as dist
+
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

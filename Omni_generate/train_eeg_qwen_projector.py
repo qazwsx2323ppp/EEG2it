@@ -507,6 +507,7 @@ def main(cfg: DictConfig) -> None:
     metrics_path = out_dir / "stage2_metrics.jsonl"
 
     best_score = float("-inf")
+    best_path = out_dir / "best_eeg_projector.pth"
 
     def _append_metrics(obj: dict[str, Any]) -> None:
         if is_dist and not _is_rank0(rank):

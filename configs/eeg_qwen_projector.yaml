@@ -74,8 +74,8 @@ training:
   max_train_steps: 0
 
 eval:
-  enabled: false
-  max_batches: 4
+  enabled: true
+  max_batches: 2
   max_new_tokens: 64
   instruction: "Describe the image as a short Stable Diffusion prompt."
   retrieval:

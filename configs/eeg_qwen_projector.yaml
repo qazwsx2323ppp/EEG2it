@@ -85,7 +85,7 @@ eval:
     num_candidates: 2048
   clip:
     enabled: true
-    model: "openai/clip-vit-base-patch32"
+    model: /media/wsqlab/data/ctp_file/EEG2it/temp/clip-vit-large-patch14
     # Set true only if you can download weights (requires internet).
     allow_download: false
 

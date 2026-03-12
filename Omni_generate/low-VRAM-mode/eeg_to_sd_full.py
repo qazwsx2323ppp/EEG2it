@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -41,6 +42,60 @@ def _build_dataset(args):
     cfg_data = _make_cfg_data(args)
     return TripletDataset(cfg_data, mode=args.split, split_index=int(args.split_index))
 
+def _safe_name(name: str) -> str:
+    name = str(name).strip()
+    if not name:
+        return ""
+    base = os.path.basename(name)
+    stem, _ = os.path.splitext(base)
+    stem = stem.strip()
+    if not stem:
+        return ""
+    # Keep only safe characters for filenames.
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem)
+    return stem[:120]
+
+def _load_image_name_map(image_data_path: str):
+    if not image_data_path:
+        return None
+    if not os.path.isfile(image_data_path):
+        return None
+    try:
+        data = torch.load(image_data_path, map_location="cpu")
+    except Exception:
+        return None
+
+    # Common patterns: list of dicts, dict with "images"/"data", list of strings
+    if isinstance(data, dict):
+        for key in ("images", "data", "image_data", "items"):
+            if key in data:
+                data = data[key]
+                break
+
+    if isinstance(data, list):
+        # If list elements are dicts, try common fields
+        if data and isinstance(data[0], dict):
+            def _get_name(i: int):
+                item = data[i]
+                return (
+                    item.get("file_name")
+                    or item.get("filename")
+                    or item.get("path")
+                    or item.get("image_path")
+                    or item.get("image")
+                    or ""
+                )
+            return _get_name
+        # If list of strings
+        if data and isinstance(data[0], str):
+            return lambda i: data[i]
+
+    # If dict mapping id->name
+    if isinstance(data, dict):
+        return lambda i: data.get(int(i), data.get(str(i), ""))
+
+    return None
+
 
 def main():
     parser = argparse.ArgumentParser(description="EEG -> prompt (Qwen) -> SD image (full pipeline)")
@@ -49,6 +104,7 @@ def main():
     parser.add_argument("--image_vec_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/image_vectors_aligned.npy")
     parser.add_argument("--text_vec_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/text_vectors_aligned.npy")
     parser.add_argument("--splits_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/block_splits_by_image_all.pth")
+    parser.add_argument("--image_data_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/image_data.pth")
     parser.add_argument("--captions_dir", type=str, default="")
     parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     parser.add_argument("--split_index", type=int, default=0)
@@ -81,6 +137,7 @@ def main():
 
     # 1) Build dataset
     ds = _build_dataset(args)
+    get_image_name = _load_image_name_map(args.image_data_path)
 
     # 2) EEG encoder
     use_half = device.type == "cuda"
@@ -151,6 +208,12 @@ def main():
     for idx in range(start_idx, end_idx):
         item = ds[idx]
         eeg = item[0]
+        target_id = None
+        if isinstance(item, (list, tuple)) and len(item) >= 4:
+            try:
+                target_id = int(item[3])
+            except Exception:
+                target_id = None
         if eeg.dim() == 2:
             eeg = eeg.unsqueeze(0)
         eeg = eeg.to(device)
@@ -181,13 +244,32 @@ def main():
             seed=args.seed,
         )
 
+        image_name = ""
+        if target_id is not None and get_image_name is not None:
+            try:
+                image_name = _safe_name(get_image_name(target_id))
+            except Exception:
+                image_name = ""
+
         if args.num_samples == 1:
             out_path = args.out
         else:
-            out_path = os.path.join(out_dir, f"{args.out_prefix}_{idx:05d}.png")
+            parts = [args.out_prefix, f"{idx:05d}"]
+            if image_name:
+                parts.append(image_name)
+            elif target_id is not None:
+                parts.append(f"img{target_id:05d}")
+            out_path = os.path.join(out_dir, "_".join(parts) + ".png")
 
         image.save(out_path)
         print(f"Saved image: {out_path}")
+        # Save prompt alongside image
+        prompt_path = os.path.splitext(out_path)[0] + ".txt"
+        try:
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(prompt.strip() + "\n")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

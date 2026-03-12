@@ -163,7 +163,7 @@ def main():
         if args.num_samples == 1:
             out_path = args.out
         else:
-            out_path = os.path.join(out_dir, f\"{args.out_prefix}_{idx:05d}.png\")
+            out_path = os.path.join(out_dir, f"{args.out_prefix}_{idx:05d}.png")
 
         image.save(out_path)
         print(f\"Saved image: {out_path}\")

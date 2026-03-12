@@ -100,19 +100,31 @@ def main():
 
     # 3) Qwen prompt generation
     tokenizer = AutoTokenizer.from_pretrained(args.qwen_dir, trust_remote_code=True, local_files_only=True)
+    if device.type == "cuda":
+        qwen_dtype = torch.float16
+    else:
+        qwen_dtype = torch.float32
     model = qwen_mod.Qwen2_5OmniForConditionalGeneration.from_pretrained(
-        args.qwen_dir, trust_remote_code=True, local_files_only=True, torch_dtype="auto"
+        args.qwen_dir, trust_remote_code=True, local_files_only=True, torch_dtype=qwen_dtype
     ).to(device)
+    if use_half:
+        model = model.half()
     model.eeg_encoder = eeg_encoder
     model.eeg_projector.load_state_dict(torch.load(args.eeg_projector_ckpt, map_location="cpu"))
 
     # 4) SD generation with EEG visual token
+    sd_tokenizer_dir = args.sd_tokenizer_dir.strip()
+    if sd_tokenizer_dir:
+        vocab_path = os.path.join(sd_tokenizer_dir, "vocab.json")
+        merges_path = os.path.join(sd_tokenizer_dir, "merges.txt")
+        if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
+            sd_tokenizer_dir = ""
     painter = StableDiffusionPainter(
         model_id=args.sd_model,
         device=str(device),
         torch_dtype=torch.float16,
         original_config_file=(args.sd_config or None),
-        tokenizer_dir=(args.sd_tokenizer_dir or None),
+        tokenizer_dir=(sd_tokenizer_dir or None),
     )
     sd_hidden = painter.pipe.text_encoder.config.hidden_size
     eeg_img_proj = torch.nn.Linear(512, sd_hidden).to(device)

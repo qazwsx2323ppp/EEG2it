@@ -42,12 +42,34 @@ class StableDiffusionPainter:
                         tokenizer = None
                 else:
                     tokenizer = None
+                kwargs = {
+                    "torch_dtype": torch_dtype,
+                    "safety_checker": None,
+                }
+                if tokenizer is not None:
+                    kwargs["tokenizer"] = tokenizer
                 self.pipe = StableDiffusionPipeline.from_pretrained(
                     model_id,
-                    torch_dtype=torch_dtype,
-                    safety_checker=None,
-                    tokenizer=tokenizer,
+                    **kwargs,
                 )
+                # Fallback: ensure tokenizer exists (offline setups may only have tokenizer.json)
+                if getattr(self.pipe, "tokenizer", None) is None:
+                    try:
+                        from transformers import AutoTokenizer
+                        if tokenizer_dir:
+                            self.pipe.tokenizer = AutoTokenizer.from_pretrained(
+                                tokenizer_dir, use_fast=True, local_files_only=True
+                            )
+                        else:
+                            self.pipe.tokenizer = AutoTokenizer.from_pretrained(
+                                model_id, subfolder="tokenizer", use_fast=True, local_files_only=True
+                            )
+                    except Exception as tok_e:
+                        print(f"Failed to load fallback tokenizer: {tok_e}")
+                if getattr(self.pipe, "tokenizer", None) is None:
+                    raise ValueError(
+                        "Tokenizer is None. Provide --sd_tokenizer_dir with tokenizer.json or vocab/merges."
+                    )
         except Exception as e:
             print(f"Failed to load Stable Diffusion model: {e}")
             # Fallback or re-raise

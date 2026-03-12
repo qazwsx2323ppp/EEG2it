@@ -83,12 +83,15 @@ def main():
     ds = _build_dataset(args)
 
     # 2) EEG encoder
+    use_half = device.type == "cuda"
     eeg_encoder = SpatialMoEEncoder(
         n_channels=128,
         n_samples=512,
         embedding_dim=512,
         pretrained_path=None,
-    ).to(device).half()
+    ).to(device)
+    if use_half:
+        eeg_encoder = eeg_encoder.half()
     state = torch.load(args.eeg_ckpt, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
@@ -112,7 +115,9 @@ def main():
         tokenizer_dir=(args.sd_tokenizer_dir or None),
     )
     sd_hidden = painter.pipe.text_encoder.config.hidden_size
-    eeg_img_proj = torch.nn.Linear(512, sd_hidden).to(device).half()
+    eeg_img_proj = torch.nn.Linear(512, sd_hidden).to(device)
+    if use_half:
+        eeg_img_proj = eeg_img_proj.half()
     if args.eeg_img_proj_ckpt and os.path.exists(args.eeg_img_proj_ckpt):
         eeg_img_proj.load_state_dict(torch.load(args.eeg_img_proj_ckpt, map_location="cpu"))
 
@@ -137,9 +142,11 @@ def main():
         if eeg.dim() == 2:
             eeg = eeg.unsqueeze(0)
         eeg = eeg.to(device)
+        if use_half:
+            eeg = eeg.half()
 
         with torch.no_grad():
-            emb_img, emb_txt, _ = eeg_encoder(eeg.half())
+            emb_img, emb_txt, _ = eeg_encoder(eeg)
 
         gen_ids = model.generate_from_eeg(
             eeg_input=eeg,

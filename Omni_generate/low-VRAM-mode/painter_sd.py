@@ -1,4 +1,5 @@
 ﻿import torch
+import os
 from diffusers import StableDiffusionPipeline
 
 class StableDiffusionPainter:
@@ -28,9 +29,14 @@ class StableDiffusionPainter:
                 if tokenizer_dir:
                     try:
                         from transformers import CLIPTokenizer
-                        tokenizer = CLIPTokenizer.from_pretrained(
-                            tokenizer_dir, local_files_only=True
-                        )
+                        vocab_path = os.path.join(tokenizer_dir, "vocab.json")
+                        merges_path = os.path.join(tokenizer_dir, "merges.txt")
+                        if os.path.exists(vocab_path) and os.path.exists(merges_path):
+                            tokenizer = CLIPTokenizer.from_pretrained(
+                                tokenizer_dir, local_files_only=True
+                            )
+                        else:
+                            tokenizer = None
                     except Exception as tok_e:
                         print(f"Failed to load tokenizer from {tokenizer_dir}: {tok_e}")
                         tokenizer = None

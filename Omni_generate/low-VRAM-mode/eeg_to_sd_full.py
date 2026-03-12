@@ -166,7 +166,7 @@ def main():
             out_path = os.path.join(out_dir, f"{args.out_prefix}_{idx:05d}.png")
 
         image.save(out_path)
-        print(f\"Saved image: {out_path}\")
+        print(f"Saved image: {out_path}")
 
 
 if __name__ == "__main__":

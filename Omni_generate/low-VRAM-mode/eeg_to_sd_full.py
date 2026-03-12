@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--qwen_dir", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/Qwen2.5-Omni-3B")
     parser.add_argument("--sd_model", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/sd15-diffusers")
     parser.add_argument("--sd_config", type=str, default="")
+    parser.add_argument("--sd_tokenizer_dir", type=str, default="")
     parser.add_argument("--eeg_img_proj_ckpt", type=str, default="")
 
     parser.add_argument("--prompt_instruction", type=str, default="Describe the image as a short Stable Diffusion prompt.")
@@ -108,6 +109,7 @@ def main():
         device=str(device),
         torch_dtype=torch.float16,
         original_config_file=(args.sd_config or None),
+        tokenizer_dir=(args.sd_tokenizer_dir or None),
     )
     sd_hidden = painter.pipe.text_encoder.config.hidden_size
     eeg_img_proj = torch.nn.Linear(512, sd_hidden).to(device).half()

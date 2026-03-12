@@ -9,6 +9,7 @@ class StableDiffusionPainter:
         torch_dtype=torch.float16,
         original_config_file=None,
         torch_load_args=None,
+        tokenizer_dir=None,
     ):
         self.device = device
         self.dtype = torch_dtype
@@ -24,8 +25,22 @@ class StableDiffusionPainter:
                     kwargs["torch_load_args"] = torch_load_args
                 self.pipe = StableDiffusionPipeline.from_single_file(model_id, **kwargs)
             else:
+                if tokenizer_dir:
+                    try:
+                        from transformers import CLIPTokenizer
+                        tokenizer = CLIPTokenizer.from_pretrained(
+                            tokenizer_dir, local_files_only=True
+                        )
+                    except Exception as tok_e:
+                        print(f"Failed to load tokenizer from {tokenizer_dir}: {tok_e}")
+                        tokenizer = None
+                else:
+                    tokenizer = None
                 self.pipe = StableDiffusionPipeline.from_pretrained(
-                    model_id, torch_dtype=torch_dtype, safety_checker=None
+                    model_id,
+                    torch_dtype=torch_dtype,
+                    safety_checker=None,
+                    tokenizer=tokenizer,
                 )
         except Exception as e:
             print(f"Failed to load Stable Diffusion model: {e}")

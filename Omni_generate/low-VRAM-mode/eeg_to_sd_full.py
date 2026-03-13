@@ -96,6 +96,34 @@ def _load_image_name_map(image_data_path: str):
 
     return None
 
+def _load_eeg_image_list(eeg_pth: str):
+    if not eeg_pth or not os.path.isfile(eeg_pth):
+        return []
+    try:
+        eeg = torch.load(eeg_pth, map_location="cpu")
+    except Exception:
+        return []
+    if isinstance(eeg, dict) and isinstance(eeg.get("images"), list):
+        return eeg.get("images") or []
+    return []
+
+def _build_image_list(image_root: str, exts: tuple[str, ...]):
+    if not image_root or not os.path.isdir(image_root):
+        return []
+    image_root = os.path.abspath(image_root)
+    rel_paths: list[str] = []
+    for cls in sorted(os.listdir(image_root)):
+        cls_dir = os.path.join(image_root, cls)
+        if not os.path.isdir(cls_dir):
+            continue
+        files = []
+        for fn in os.listdir(cls_dir):
+            if fn.lower().endswith(exts):
+                files.append(fn)
+        for fn in sorted(files):
+            rel_paths.append(os.path.join(cls, fn))
+    return rel_paths
+
 
 def main():
     parser = argparse.ArgumentParser(description="EEG -> prompt (Qwen) -> SD image (full pipeline)")
@@ -105,6 +133,8 @@ def main():
     parser.add_argument("--text_vec_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/text_vectors_aligned.npy")
     parser.add_argument("--splits_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/block_splits_by_image_all.pth")
     parser.add_argument("--image_data_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/image_data.pth")
+    parser.add_argument("--image_root", type=str, default="")
+    parser.add_argument("--image_exts", type=str, default=".jpg,.jpeg,.png,.bmp,.webp,.jpeg,.jpeg,.JPEG,.JPG")
     parser.add_argument("--captions_dir", type=str, default="")
     parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     parser.add_argument("--split_index", type=int, default=0)
@@ -138,6 +168,9 @@ def main():
     # 1) Build dataset
     ds = _build_dataset(args)
     get_image_name = _load_image_name_map(args.image_data_path)
+    eeg_images = _load_eeg_image_list(args.eeg_path)
+    exts = tuple(x.strip().lower() for x in args.image_exts.split(",") if x.strip())
+    image_list = _build_image_list(args.image_root, exts)
 
     # 2) EEG encoder
     use_half = device.type == "cuda"
@@ -245,9 +278,22 @@ def main():
         )
 
         image_name = ""
+        # Priority 1: eeg.pth provides explicit image list
+        if target_id is not None and eeg_images:
+            try:
+                if 0 <= int(target_id) < len(eeg_images):
+                    image_name = _safe_name(eeg_images[int(target_id)])
+            except Exception:
+                image_name = ""
         if target_id is not None and get_image_name is not None:
             try:
                 image_name = _safe_name(get_image_name(target_id))
+            except Exception:
+                image_name = ""
+        if not image_name and target_id is not None and image_list:
+            try:
+                if 0 <= int(target_id) < len(image_list):
+                    image_name = _safe_name(image_list[int(target_id)])
             except Exception:
                 image_name = ""
 

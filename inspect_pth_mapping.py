@@ -83,6 +83,10 @@ def main():
     if isinstance(eeg, dict):
         print("keys:", list(eeg.keys()))
     dataset = eeg["dataset"] if isinstance(eeg, dict) and "dataset" in eeg else None
+    eeg_images = eeg.get("images") if isinstance(eeg, dict) else None
+    if isinstance(eeg_images, list) and eeg_images:
+        print("eeg_images_len:", len(eeg_images))
+        print("eeg_images_head:", eeg_images[:5])
     if dataset is None:
         print("No 'dataset' key found in EEG pth.")
         return
@@ -131,7 +135,13 @@ def main():
         if image_id is not None and image_list:
             if 0 <= int(image_id) < len(image_list):
                 name2 = image_list[int(image_id)]
-        print(f"[{i}] eeg_idx={int(eeg_idx)} image_id={image_id} image_name={name} image_root_name={name2}")
+        name3 = ""
+        if image_id is not None and isinstance(eeg_images, list) and 0 <= int(image_id) < len(eeg_images):
+            name3 = eeg_images[int(image_id)]
+        print(
+            f"[{i}] eeg_idx={int(eeg_idx)} image_id={image_id} "
+            f"image_name={name} image_root_name={name2} eeg_images_name={name3}"
+        )
 
 
 if __name__ == "__main__":

@@ -42,12 +42,31 @@ def _safe_get_image_name(image_data: Any, image_id: int) -> str:
             return item
     return ""
 
+def _build_image_list(image_root: str, exts: tuple[str, ...]):
+    if not image_root or not os.path.isdir(image_root):
+        return []
+    image_root = os.path.abspath(image_root)
+    rel_paths: list[str] = []
+    for cls in sorted(os.listdir(image_root)):
+        cls_dir = os.path.join(image_root, cls)
+        if not os.path.isdir(cls_dir):
+            continue
+        files = []
+        for fn in os.listdir(cls_dir):
+            if fn.lower().endswith(exts):
+                files.append(fn)
+        for fn in sorted(files):
+            rel_paths.append(os.path.join(cls, fn))
+    return rel_paths
+
 
 def main():
     ap = argparse.ArgumentParser(description="Inspect EEG/image mapping in .pth files.")
     ap.add_argument("--eeg_pth", required=True, help="Path to eeg_*.pth")
     ap.add_argument("--splits_pth", required=True, help="Path to block_splits_by_image_all.pth")
     ap.add_argument("--image_data_pth", default="", help="Path to image_data.pth (optional)")
+    ap.add_argument("--image_root", default="", help="Root folder of images (class subfolders)")
+    ap.add_argument("--image_exts", default=".jpg,.jpeg,.png,.bmp,.webp", help="Comma-separated extensions")
     ap.add_argument("--split", default="train", choices=["train", "val", "test"])
     ap.add_argument("--split_index", type=int, default=0)
     ap.add_argument("--num", type=int, default=10, help="Number of samples to show")
@@ -56,6 +75,8 @@ def main():
     eeg = torch.load(args.eeg_pth, map_location="cpu")
     splits = torch.load(args.splits_pth, map_location="cpu")
     image_data = torch.load(args.image_data_pth, map_location="cpu") if args.image_data_pth else None
+    exts = tuple(x.strip().lower() for x in args.image_exts.split(",") if x.strip())
+    image_list = _build_image_list(args.image_root, exts)
 
     print("=== EEG .pth ===")
     print("type:", _summarize(eeg))
@@ -106,8 +127,16 @@ def main():
         if isinstance(eeg_item, dict):
             image_id = eeg_item.get("image", None)
         name = _safe_get_image_name(image_data, int(image_id)) if image_id is not None else ""
-        print(f"[{i}] eeg_idx={int(eeg_idx)} image_id={image_id} image_name={name}")
+        name2 = ""
+        if image_id is not None and image_list:
+            if 0 <= int(image_id) < len(image_list):
+                name2 = image_list[int(image_id)]
+        print(f"[{i}] eeg_idx={int(eeg_idx)} image_id={image_id} image_name={name} image_root_name={name2}")
 
 
 if __name__ == "__main__":
     main()
+    if image_list:
+        print(f"image_root: {args.image_root}")
+        print("image_list_len:", len(image_list))
+        print("image_list_head:", image_list[:5])

@@ -179,6 +179,7 @@ def main():
     parser.add_argument("--out", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/output_eeg_to_sd.png")
     parser.add_argument("--out_dir", type=str, default="")
     parser.add_argument("--out_prefix", type=str, default="eeg_to_sd")
+    parser.add_argument("--disable_eeg_token", action="store_true", help="Disable EEG visual token injection")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -243,7 +244,8 @@ def main():
     eeg_img_proj = torch.nn.Linear(512, sd_hidden).to(device)
     if use_half:
         eeg_img_proj = eeg_img_proj.half()
-    if args.eeg_img_proj_ckpt and os.path.exists(args.eeg_img_proj_ckpt):
+    has_img_proj_ckpt = bool(args.eeg_img_proj_ckpt and os.path.exists(args.eeg_img_proj_ckpt))
+    if has_img_proj_ckpt:
         eeg_img_proj.load_state_dict(torch.load(args.eeg_img_proj_ckpt, map_location="cpu"))
 
     # 5) Iterate samples
@@ -285,39 +287,65 @@ def main():
             prompt_text=args.prompt_instruction,
             max_new_tokens=args.max_new_tokens,
         )
-        prompt = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0]
+        raw_prompt = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0]
+        prompt = raw_prompt.strip()
+        if not prompt:
+            syn = ""
+            if image_name_raw:
+                base = os.path.basename(str(image_name_raw))
+                stem = os.path.splitext(base)[0]
+                syn = stem.split("_")[0] if "_" in stem else stem
+            if syn:
+                prompt = f"a photo of {syn}"
+            else:
+                prompt = "a photo"
         print(f"[Prompt][{idx}] {prompt}")
 
-        image = painter.generate_with_eeg(
-            prompt=prompt,
-            eeg_img_emb=emb_img,
-            eeg_proj=eeg_img_proj,
-            negative_prompt="blurry, low quality, distorted",
-            num_inference_steps=25,
-            guidance_scale=7.5,
-            height=512,
-            width=512,
-            seed=args.seed,
-        )
+        use_eeg_token = has_img_proj_ckpt and (not args.disable_eeg_token)
+        if use_eeg_token:
+            image = painter.generate_with_eeg(
+                prompt=prompt,
+                eeg_img_emb=emb_img,
+                eeg_proj=eeg_img_proj,
+                negative_prompt="blurry, low quality, distorted",
+                num_inference_steps=25,
+                guidance_scale=7.5,
+                height=512,
+                width=512,
+                seed=args.seed,
+            )
+        else:
+            image = painter.generate(
+                prompt=prompt,
+                negative_prompt="blurry, low quality, distorted",
+                num_inference_steps=25,
+                guidance_scale=7.5,
+                height=512,
+                width=512,
+                seed=args.seed,
+            )
 
+        image_name_raw = ""
         image_name = ""
         # Priority 1: eeg.pth provides explicit image list
         if target_id is not None and eeg_images:
             try:
                 if 0 <= int(target_id) < len(eeg_images):
-                    raw_name = _resolve_eeg_image_name(eeg_images[int(target_id)], args.image_root, exts)
-                    image_name = _safe_name(raw_name)
+                    image_name_raw = _resolve_eeg_image_name(eeg_images[int(target_id)], args.image_root, exts)
+                    image_name = _safe_name(image_name_raw)
             except Exception:
                 image_name = ""
         if target_id is not None and get_image_name is not None:
             try:
-                image_name = _safe_name(get_image_name(target_id))
+                image_name_raw = get_image_name(target_id)
+                image_name = _safe_name(image_name_raw)
             except Exception:
                 image_name = ""
         if not image_name and target_id is not None and image_list:
             try:
                 if 0 <= int(target_id) < len(image_list):
-                    image_name = _safe_name(image_list[int(target_id)])
+                    image_name_raw = image_list[int(target_id)]
+                    image_name = _safe_name(image_name_raw)
             except Exception:
                 image_name = ""
 
@@ -337,7 +365,14 @@ def main():
         prompt_path = os.path.splitext(out_path)[0] + ".txt"
         try:
             with open(prompt_path, "w", encoding="utf-8") as f:
-                f.write(prompt.strip() + "\n")
+                f.write(f"RAW_PROMPT: {raw_prompt}\n")
+                f.write(f"USED_PROMPT: {prompt}\n")
+                if image_name_raw:
+                    f.write(f"IMAGE_NAME: {image_name_raw}\n")
+                if target_id is not None:
+                    f.write(f"IMAGE_ID: {int(target_id)}\n")
+                f.write(f"EEG_INDEX: {idx}\n")
+                f.write(f"USE_EEG_TOKEN: {bool(use_eeg_token)}\n")
         except Exception:
             pass
 

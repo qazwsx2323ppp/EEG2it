@@ -62,12 +62,15 @@ def main():
     ap.add_argument("--text_vec_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/text_vectors_aligned.npy")
     ap.add_argument("--splits_path", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/data/EEG_data/block_splits_by_image_all.pth")
     ap.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    ap.add_argument("--val_split", type=str, default="val", choices=["train", "val", "test"])
     ap.add_argument("--split_index", type=int, default=0)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--max_batches", type=int, default=0, help="0 = all batches")
+    ap.add_argument("--max_val_batches", type=int, default=0, help="0 = all batches")
+    ap.add_argument("--patience", type=int, default=3, help="early stop patience on val loss")
     ap.add_argument("--eeg_ckpt", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/best_fornow.pth")
     ap.add_argument("--sd_model", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/sd15-diffusers")
     ap.add_argument("--sd_tokenizer_dir", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/sd15-diffusers/tokenizer")
@@ -81,6 +84,8 @@ def main():
     # Dataset
     ds = TripletDataset(_make_cfg_data(args), mode=args.split, split_index=int(args.split_index))
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+    val_ds = TripletDataset(_make_cfg_data(args), mode=args.val_split, split_index=int(args.split_index))
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
 
     eeg_images = _load_eeg_images_list(args.eeg_path)
 
@@ -121,9 +126,11 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=use_half)
 
     best_loss = float("inf")
+    bad_epochs = 0
     for epoch in range(args.epochs):
         running = 0.0
         steps = 0
+        proj.train()
         for batch in dl:
             eeg = batch[0].to(device)
             target_id = batch[3].to(device) if len(batch) >= 4 else None
@@ -161,11 +168,52 @@ def main():
                 break
 
         avg = running / max(1, steps)
-        print(f"[EEG_IMG_PROJ] epoch={epoch} loss={avg:.6f}")
-        if avg < best_loss:
-            best_loss = avg
+        print(f"[EEG_IMG_PROJ] epoch={epoch} train_loss={avg:.6f}")
+
+        # Validation
+        val_loss = None
+        if len(val_ds) > 0:
+            proj.eval()
+            v_running = 0.0
+            v_steps = 0
+            with torch.no_grad():
+                for batch in val_dl:
+                    eeg = batch[0].to(device)
+                    target_id = batch[3].to(device) if len(batch) >= 4 else None
+                    if use_half:
+                        eeg = eeg.half()
+                    emb_img, _, _ = eeg_encoder(eeg)
+                    prompts = _build_prompts(target_id, eeg_images) if target_id is not None else ["a photo"] * eeg.shape[0]
+                    text_inputs = tokenizer(
+                        prompts,
+                        padding="max_length",
+                        max_length=tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt",
+                    ).to(device)
+                    text_emb = text_encoder(text_inputs.input_ids)[0]
+                    text_pooled = text_emb[:, 0]
+                    pred = proj(emb_img.float())
+                    loss = torch.nn.functional.mse_loss(pred, text_pooled.float())
+                    v_running += float(loss.item())
+                    v_steps += 1
+                    if args.max_val_batches and v_steps >= args.max_val_batches:
+                        break
+            val_loss = v_running / max(1, v_steps)
+            print(f"[EEG_IMG_PROJ] epoch={epoch} val_loss={val_loss:.6f}")
+
+        # Selection metric: val_loss if available, else train loss
+        sel = val_loss if val_loss is not None else avg
+        if sel < best_loss:
+            best_loss = sel
+            bad_epochs = 0
             torch.save(proj.state_dict(), args.out_ckpt)
             print(f"[EEG_IMG_PROJ] saved best to {args.out_ckpt}")
+        else:
+            bad_epochs += 1
+            if args.patience > 0 and bad_epochs >= args.patience:
+                print(f"[EEG_IMG_PROJ] early stop (patience={args.patience})")
+                break
 
 
 if __name__ == "__main__":

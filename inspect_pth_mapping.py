@@ -1,0 +1,113 @@
+import argparse
+import os
+from typing import Any
+
+import torch
+
+
+def _summarize(obj: Any, max_items: int = 5) -> str:
+    if isinstance(obj, dict):
+        keys = list(obj.keys())
+        return f"dict(keys={keys[:max_items]}{'...' if len(keys) > max_items else ''})"
+    if isinstance(obj, (list, tuple)):
+        return f"{type(obj).__name__}(len={len(obj)})"
+    return f"{type(obj).__name__}"
+
+
+def _safe_get_image_name(image_data: Any, image_id: int) -> str:
+    if image_data is None:
+        return ""
+    # dict with list under common keys
+    if isinstance(image_data, dict):
+        for key in ("images", "data", "image_data", "items"):
+            if key in image_data:
+                return _safe_get_image_name(image_data[key], image_id)
+        # dict mapping id->name
+        if image_id in image_data:
+            return str(image_data[image_id])
+        if str(image_id) in image_data:
+            return str(image_data[str(image_id)])
+        return ""
+    # list of dicts
+    if isinstance(image_data, list):
+        if image_id < 0 or image_id >= len(image_data):
+            return ""
+        item = image_data[image_id]
+        if isinstance(item, dict):
+            for k in ("file_name", "filename", "path", "image_path", "image"):
+                if k in item:
+                    return str(item[k])
+            return str(item)
+        if isinstance(item, str):
+            return item
+    return ""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Inspect EEG/image mapping in .pth files.")
+    ap.add_argument("--eeg_pth", required=True, help="Path to eeg_*.pth")
+    ap.add_argument("--splits_pth", required=True, help="Path to block_splits_by_image_all.pth")
+    ap.add_argument("--image_data_pth", default="", help="Path to image_data.pth (optional)")
+    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
+    ap.add_argument("--split_index", type=int, default=0)
+    ap.add_argument("--num", type=int, default=10, help="Number of samples to show")
+    args = ap.parse_args()
+
+    eeg = torch.load(args.eeg_pth, map_location="cpu")
+    splits = torch.load(args.splits_pth, map_location="cpu")
+    image_data = torch.load(args.image_data_pth, map_location="cpu") if args.image_data_pth else None
+
+    print("=== EEG .pth ===")
+    print("type:", _summarize(eeg))
+    if isinstance(eeg, dict):
+        print("keys:", list(eeg.keys()))
+    dataset = eeg["dataset"] if isinstance(eeg, dict) and "dataset" in eeg else None
+    if dataset is None:
+        print("No 'dataset' key found in EEG pth.")
+        return
+    print("dataset_len:", len(dataset))
+    print("dataset_item0_type:", _summarize(dataset[0]))
+    if isinstance(dataset[0], dict):
+        print("dataset_item0_keys:", list(dataset[0].keys()))
+
+    print("\n=== Splits .pth ===")
+    print("type:", _summarize(splits))
+    if isinstance(splits, dict):
+        print("keys:", list(splits.keys()))
+    splits_list = splits.get("splits") if isinstance(splits, dict) else None
+    if not splits_list:
+        print("No 'splits' key found in splits pth.")
+        return
+    print("num_splits:", len(splits_list))
+    split_obj = splits_list[args.split_index]
+    print(f"split[{args.split_index}] keys:", list(split_obj.keys()))
+    for k in ("train", "val", "test"):
+        if k in split_obj:
+            print(f"{k}_len:", len(split_obj[k]))
+
+    print("\n=== Image data .pth ===")
+    if image_data is None:
+        print("No image_data provided.")
+    else:
+        print("type:", _summarize(image_data))
+        if isinstance(image_data, dict):
+            print("keys:", list(image_data.keys())[:20])
+        if isinstance(image_data, list) and image_data:
+            print("image_data_item0_type:", _summarize(image_data[0]))
+            if isinstance(image_data[0], dict):
+                print("image_data_item0_keys:", list(image_data[0].keys()))
+
+    # Show mapping for first N items in split
+    print("\n=== Sample mapping ===")
+    split_indices = split_obj[args.split]
+    for i, eeg_idx in enumerate(split_indices[: args.num]):
+        eeg_item = dataset[int(eeg_idx)]
+        image_id = None
+        if isinstance(eeg_item, dict):
+            image_id = eeg_item.get("image", None)
+        name = _safe_get_image_name(image_data, int(image_id)) if image_id is not None else ""
+        print(f"[{i}] eeg_idx={int(eeg_idx)} image_id={image_id} image_name={name}")
+
+
+if __name__ == "__main__":
+    main()

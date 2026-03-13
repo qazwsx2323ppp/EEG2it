@@ -124,6 +124,29 @@ def _build_image_list(image_root: str, exts: tuple[str, ...]):
             rel_paths.append(os.path.join(cls, fn))
     return rel_paths
 
+def _resolve_eeg_image_name(eeg_name: str, image_root: str, exts: tuple[str, ...]) -> str:
+    name = str(eeg_name).strip()
+    if not name:
+        return ""
+    # If already has path/extension, use as-is
+    if "/" in name or "\\" in name or "." in os.path.basename(name):
+        return name
+    # Try to resolve under image_root with inferred class folder
+    synset = name.split("_")[0] if "_" in name else ""
+    if image_root and synset:
+        base_dir = os.path.join(image_root, synset)
+        if os.path.isdir(base_dir):
+            # Try known extensions
+            for ext in exts:
+                cand = os.path.join(synset, f"{name}{ext}")
+                if os.path.isfile(os.path.join(image_root, cand)):
+                    return cand
+            # Fallback: any file starting with name
+            for fn in os.listdir(base_dir):
+                if fn.startswith(name + "."):
+                    return os.path.join(synset, fn)
+    return name
+
 
 def main():
     parser = argparse.ArgumentParser(description="EEG -> prompt (Qwen) -> SD image (full pipeline)")
@@ -282,7 +305,8 @@ def main():
         if target_id is not None and eeg_images:
             try:
                 if 0 <= int(target_id) < len(eeg_images):
-                    image_name = _safe_name(eeg_images[int(target_id)])
+                    raw_name = _resolve_eeg_image_name(eeg_images[int(target_id)], args.image_root, exts)
+                    image_name = _safe_name(raw_name)
             except Exception:
                 image_name = ""
         if target_id is not None and get_image_name is not None:

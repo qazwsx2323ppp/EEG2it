@@ -59,6 +59,25 @@ def _build_image_list(image_root: str, exts: tuple[str, ...]):
             rel_paths.append(os.path.join(cls, fn))
     return rel_paths
 
+def _resolve_eeg_image_name(eeg_name: str, image_root: str, exts: tuple[str, ...]) -> str:
+    name = str(eeg_name).strip()
+    if not name:
+        return ""
+    if "/" in name or "\\" in name or "." in os.path.basename(name):
+        return name
+    synset = name.split("_")[0] if "_" in name else ""
+    if image_root and synset:
+        base_dir = os.path.join(image_root, synset)
+        if os.path.isdir(base_dir):
+            for ext in exts:
+                cand = os.path.join(synset, f"{name}{ext}")
+                if os.path.isfile(os.path.join(image_root, cand)):
+                    return cand
+            for fn in os.listdir(base_dir):
+                if fn.startswith(name + "."):
+                    return os.path.join(synset, fn)
+    return name
+
 
 def main():
     ap = argparse.ArgumentParser(description="Inspect EEG/image mapping in .pth files.")
@@ -138,9 +157,10 @@ def main():
         name3 = ""
         if image_id is not None and isinstance(eeg_images, list) and 0 <= int(image_id) < len(eeg_images):
             name3 = eeg_images[int(image_id)]
+        name4 = _resolve_eeg_image_name(name3, args.image_root, exts) if name3 else ""
         print(
             f"[{i}] eeg_idx={int(eeg_idx)} image_id={image_id} "
-            f"image_name={name} image_root_name={name2} eeg_images_name={name3}"
+            f"image_name={name} image_root_name={name2} eeg_images_name={name3} resolved_name={name4}"
         )
 
 

@@ -46,6 +46,19 @@ qwen:
     torch_dtype: "float16"
     low_cpu_mem_usage: true
 
+qformer:
+  # Enable EEG Q-Former between EEG encoder and Qwen Thinker
+  enabled: false
+  # Optional checkpoint to resume finetuning
+  ckpt_path: ""
+  # Q-Former config (kv_dim should match EEG embedding dim, default 512)
+  kv_dim: 512
+  num_queries: 4
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+  resid_scale: 0.5
+
 prompt:
   eeg_token: "<EEG>"
   instruction: "Generate a concise Stable Diffusion prompt for the image described by the brain signal."

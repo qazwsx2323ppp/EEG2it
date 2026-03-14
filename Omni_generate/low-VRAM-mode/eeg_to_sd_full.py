@@ -167,6 +167,13 @@ def main():
 
     parser.add_argument("--eeg_ckpt", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/best_fornow.pth")
     parser.add_argument("--eeg_projector_ckpt", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/best_eeg_projector.pth")
+    parser.add_argument("--eeg_qformer_ckpt", type=str, default="", help="Optional EEG Q-Former checkpoint")
+    parser.add_argument("--use_qformer", action="store_true", help="Enable EEG Q-Former for prompt generation")
+    parser.add_argument("--qformer_num_queries", type=int, default=4)
+    parser.add_argument("--qformer_num_layers", type=int, default=2)
+    parser.add_argument("--qformer_num_heads", type=int, default=8)
+    parser.add_argument("--qformer_dropout", type=float, default=0.1)
+    parser.add_argument("--qformer_resid_scale", type=float, default=0.5)
 
     parser.add_argument("--qwen_dir", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/Qwen2.5-Omni-3B")
     parser.add_argument("--sd_model", type=str, default="/media/wsqlab/data/ctp_file/EEG2it/temp/sd15-diffusers")
@@ -224,7 +231,31 @@ def main():
     if use_half:
         model = model.half()
     model.eeg_encoder = eeg_encoder
-    model.eeg_projector.load_state_dict(torch.load(args.eeg_projector_ckpt, map_location="cpu"))
+    if args.use_qformer or args.eeg_qformer_ckpt:
+        from out_qformer import EEGQFormer
+
+        thinker_cfg = getattr(model.thinker, "config", None)
+        thinker_hidden = getattr(getattr(thinker_cfg, "text_config", thinker_cfg), "hidden_size", None)
+        thinker_hidden = int(thinker_hidden or model.thinker.config.hidden_size)
+        qformer = EEGQFormer(
+            hidden_size=thinker_hidden,
+            kv_dim=512,
+            num_queries=args.qformer_num_queries,
+            num_layers=args.qformer_num_layers,
+            num_heads=args.qformer_num_heads,
+            dropout=args.qformer_dropout,
+            resid_scale=args.qformer_resid_scale,
+        ).to(device)
+        if use_half:
+            qformer = qformer.half()
+        if args.eeg_qformer_ckpt and os.path.exists(args.eeg_qformer_ckpt):
+            qformer.load_state_dict(torch.load(args.eeg_qformer_ckpt, map_location="cpu"))
+        else:
+            print("[WARN] use_qformer enabled but no eeg_qformer_ckpt provided; qformer is random.")
+        model.qformer = qformer
+        model.use_qformer = True
+    else:
+        model.eeg_projector.load_state_dict(torch.load(args.eeg_projector_ckpt, map_location="cpu"))
 
     # 4) SD generation with EEG visual token
     sd_tokenizer_dir = args.sd_tokenizer_dir.strip()

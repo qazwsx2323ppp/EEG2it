@@ -265,9 +265,13 @@ def _evaluate_generation(
             # GT CLIP vector from dataset (already normalized in dataset.py)
             gt_text_vecs.append(batch[2].float().cpu())
 
-            # EEG -> CLIP-dim embedding (frozen) -> projector (trainable, but eval no grad)
+            # EEG -> CLIP-dim embedding (frozen) -> projector/Q-Former
             emb_img, emb_txt, _ = eeg_encoder(eeg)
-            eeg_embed_h = model.eeg_projector(emb_txt)  # [B, H]
+            if getattr(model, "use_qformer", False) and getattr(model, "qformer", None) is not None:
+                kv = torch.stack([emb_img, emb_txt], dim=1)
+                eeg_embed_h = model.qformer(kv, return_sequence=False)
+            else:
+                eeg_embed_h = model.eeg_projector(emb_txt)  # [B, H]
 
             # Expand prompt to batch
             input_ids = prompt_ids_t.expand(eeg.shape[0], -1).contiguous()
@@ -469,28 +473,76 @@ def main(cfg: DictConfig) -> None:
     if not is_dist or _is_rank0(rank):
         print(f"[Stage-2] EEG token id: {eeg_tok_id}")
 
-    # Freeze everything except eeg_projector
+    # ---- Optional EEG Q-Former ----
+    use_qformer = bool(cfg.get("qformer", {}).get("enabled", False))
+    if use_qformer:
+        try:
+            from out_qformer import EEGQFormer
+        except Exception as e:
+            raise ImportError(f"Failed to import EEGQFormer from low_vram_dir: {e}")
+
+        qf_cfg = cfg.get("qformer", {})
+        thinker_cfg = getattr(model.thinker, "config", None)
+        thinker_hidden = None
+        if thinker_cfg is not None:
+            thinker_hidden = getattr(getattr(thinker_cfg, "text_config", thinker_cfg), "hidden_size", None)
+        thinker_hidden = int(thinker_hidden or model.thinker.config.hidden_size)
+        qformer = EEGQFormer(
+            hidden_size=thinker_hidden,
+            kv_dim=int(qf_cfg.get("kv_dim", 512)),
+            num_queries=int(qf_cfg.get("num_queries", 4)),
+            num_layers=int(qf_cfg.get("num_layers", 2)),
+            num_heads=int(qf_cfg.get("num_heads", 8)),
+            dropout=float(qf_cfg.get("dropout", 0.1)),
+            resid_scale=float(qf_cfg.get("resid_scale", 0.5)),
+        ).to(device=device, dtype=torch.float32)
+
+        qformer_ckpt = str(qf_cfg.get("ckpt_path", "")).strip()
+        if qformer_ckpt:
+            if not os.path.isfile(qformer_ckpt):
+                raise FileNotFoundError(f"qformer.ckpt_path not found: {qformer_ckpt}")
+            qformer.load_state_dict(torch.load(qformer_ckpt, map_location="cpu"))
+
+        model.qformer = qformer
+        model.use_qformer = True
+
+    # Freeze everything except eeg_projector / qformer (if enabled)
     for p in model.parameters():
         p.requires_grad = False
-    for p in model.eeg_projector.parameters():
-        p.requires_grad = True
-    # Keep trainable projector in fp32 to avoid GradScaler unscale errors on fp16 params.
-    model.eeg_projector = model.eeg_projector.to(device=device, dtype=torch.float32)
 
-    # Wrap eeg_projector with DDP if distributed
+    params_to_train = []
+    if use_qformer and model.qformer is not None:
+        for p in model.qformer.parameters():
+            p.requires_grad = True
+        params_to_train += list(model.qformer.parameters())
+    else:
+        for p in model.eeg_projector.parameters():
+            p.requires_grad = True
+        # Keep trainable projector in fp32 to avoid GradScaler unscale errors on fp16 params.
+        model.eeg_projector = model.eeg_projector.to(device=device, dtype=torch.float32)
+        params_to_train += list(model.eeg_projector.parameters())
+
+    # Wrap qformer or eeg_projector with DDP if distributed
     if is_dist:
         from torch.nn.parallel import DistributedDataParallel as DDP
-
-        model.eeg_projector = DDP(
-            model.eeg_projector,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
-        )
+        if use_qformer and model.qformer is not None:
+            model.qformer = DDP(
+                model.qformer,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
+        else:
+            model.eeg_projector = DDP(
+                model.eeg_projector,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
 
     # Optimizer
     optim = torch.optim.AdamW(
-        model.eeg_projector.parameters(),
+        params_to_train,
         lr=float(cfg.training.get("lr", 1e-4)),
         weight_decay=float(cfg.training.get("weight_decay", 0.0)),
     )
@@ -507,7 +559,7 @@ def main(cfg: DictConfig) -> None:
     metrics_path = out_dir / "stage2_metrics.jsonl"
 
     best_score = float("-inf")
-    best_path = out_dir / "best_eeg_projector.pth"
+    best_path = out_dir / ("best_eeg_qformer.pth" if use_qformer else "best_eeg_projector.pth")
 
     def _append_metrics(obj: dict[str, Any]) -> None:
         if is_dist and not _is_rank0(rank):
@@ -575,7 +627,11 @@ def main(cfg: DictConfig) -> None:
                 emb_img, emb_txt, _ = eeg_encoder(eeg)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                eeg_embed_h = model.eeg_projector(emb_txt)  # [B, H], trainable
+                if use_qformer and model.qformer is not None:
+                    kv = torch.stack([emb_img, emb_txt], dim=1)
+                    eeg_embed_h = model.qformer(kv, return_sequence=False)
+                else:
+                    eeg_embed_h = model.eeg_projector(emb_txt)  # [B, H], trainable
                 out = model(
                     input_ids=input_ids,
                     attention_mask=attn,
@@ -630,9 +686,14 @@ def main(cfg: DictConfig) -> None:
             improved = (score > best_score + min_delta) if selection_mode == "max" else (score < best_score - min_delta)
             if improved:
                 best_score = score
-                proj = model.eeg_projector.module if hasattr(model.eeg_projector, "module") else model.eeg_projector
-                torch.save(proj.state_dict(), best_path)
-                print(f"[Stage-2] Saved best_eeg_projector to: {best_path} ({selection_metric}={best_score:.6f})")
+                if use_qformer and model.qformer is not None:
+                    qf = model.qformer.module if hasattr(model.qformer, "module") else model.qformer
+                    torch.save(qf.state_dict(), best_path)
+                    print(f"[Stage-2] Saved best_eeg_qformer to: {best_path} ({selection_metric}={best_score:.6f})")
+                else:
+                    proj = model.eeg_projector.module if hasattr(model.eeg_projector, "module") else model.eeg_projector
+                    torch.save(proj.state_dict(), best_path)
+                    print(f"[Stage-2] Saved best_eeg_projector to: {best_path} ({selection_metric}={best_score:.6f})")
 
         _append_metrics(
             {

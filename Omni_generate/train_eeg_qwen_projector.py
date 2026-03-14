@@ -881,7 +881,12 @@ def main(cfg: DictConfig) -> None:
             global_step += 1
 
             if log_every and (global_step % log_every == 0) and (not is_dist or _is_rank0(rank)):
-                print(f"[Stage-2] step={global_step} loss={running / max(1, nloss):.4f}")
+                lm_val = float(lm_loss.item()) if lm_loss is not None else 0.0
+                ct_val = float(contrast_loss.item()) if contrast_loss is not None else 0.0
+                print(
+                    f"[Stage-2] step={global_step} loss={running / max(1, nloss):.4f} "
+                    f"lm={lm_val:.4f} contrast={ct_val:.4f}"
+                )
 
             if max_steps and global_step >= max_steps:
                 break

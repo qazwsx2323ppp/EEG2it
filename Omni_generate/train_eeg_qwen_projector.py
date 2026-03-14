@@ -310,8 +310,16 @@ def _evaluate_generation(
     if clip_model is None:
         return result
 
-    gen_clip = _clip_text_embed(clip_model, clip_proc, clip_device, texts_gen)  # [M, 512] on CPU
-    gt_text = torch.cat(gt_text_vecs, dim=0)  # [M, 512] on CPU
+    gen_clip = _clip_text_embed(clip_model, clip_proc, clip_device, texts_gen)  # [M, D] on CPU
+    gt_text = torch.cat(gt_text_vecs, dim=0)  # [M, D_gt] on CPU
+
+    if gen_clip.shape[-1] != gt_text.shape[-1]:
+        # Mismatch between CLIP model dim (e.g., 768 for ViT-L) and dataset text vectors (often 512).
+        print(
+            f"[eval] CLIP dim mismatch: gen_clip={gen_clip.shape[-1]} vs gt_text={gt_text.shape[-1]}. "
+            "Skipping CLIP similarity and retrieval metrics."
+        )
+        return result
 
     # cosine sim since both normalized
     sim = (gen_clip * gt_text).sum(dim=-1)

@@ -224,6 +224,43 @@ def _clip_text_embed(clip_model, clip_proc, device, texts: list[str]) -> "torch.
     return torch.cat(feats_all, dim=0)
 
 
+def _all_gather_tensor(tensor):
+    import torch
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return tensor
+    world = dist.get_world_size()
+    out = [torch.zeros_like(tensor) for _ in range(world)]
+    dist.all_gather(out, tensor)
+    return torch.cat(out, dim=0)
+
+
+def _contrastive_loss(
+    *,
+    eeg_feat: "torch.Tensor",
+    target_ids: "torch.Tensor",
+    all_text_vectors: "torch.Tensor",
+    temperature: float,
+    use_all_gather: bool,
+):
+    import torch
+    import torch.nn.functional as F
+
+    eeg_feat = F.normalize(eeg_feat, dim=-1)
+    if use_all_gather:
+        eeg_feat = _all_gather_tensor(eeg_feat)
+        target_ids = _all_gather_tensor(target_ids)
+    text_feat = all_text_vectors[target_ids.long()].to(eeg_feat.device)
+    text_feat = F.normalize(text_feat, dim=-1)
+    logits = eeg_feat @ text_feat.T
+    if temperature and temperature > 0:
+        logits = logits / float(temperature)
+    labels = torch.arange(logits.size(0), device=logits.device)
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
+
 def _evaluate_generation(
     *,
     cfg: DictConfig,
@@ -233,6 +270,7 @@ def _evaluate_generation(
     val_loader,
     eeg_tok_id: int,
     all_text_vectors_cpu: Optional["torch.Tensor"],
+    contrastive_proj=None,
 ):
     import torch
 
@@ -363,6 +401,37 @@ def _evaluate_generation(
         for p, gt_id in zip(pred, target_ids_all):
             hits += int(int(p) == int(gt_id))
         result["eval/clip_hit1"] = float(hits / max(1, len(target_ids_all)))
+
+    # Contrastive retrieval hit@1 (optional)
+    if contrastive_proj is not None and all_text_vectors_cpu is not None and target_ids_all:
+        import torch
+
+        all_text = all_text_vectors_cpu.to(device)
+        hits = 0
+        total = 0
+        with torch.no_grad():
+            for bidx, batch in enumerate(val_loader):
+                if bidx >= max_batches:
+                    break
+                eeg = batch[0].to(device)
+                tgt_ids = batch[3] if len(batch) >= 4 else None
+                if tgt_ids is None:
+                    continue
+                tgt_ids = tgt_ids.long().to(device)
+                emb_img, emb_txt, _ = eeg_encoder(eeg)
+                if getattr(model, "use_qformer", False) and getattr(model, "qformer", None) is not None:
+                    kv = torch.stack([emb_img, emb_txt], dim=1)
+                    eeg_embed_h = model.qformer(kv, return_sequence=False)
+                else:
+                    eeg_embed_h = model.eeg_projector(emb_txt)
+                eeg_feat = contrastive_proj(eeg_embed_h.float())
+                eeg_feat = torch.nn.functional.normalize(eeg_feat, dim=-1)
+                sims = eeg_feat @ all_text.T
+                pred = sims.argmax(dim=-1)
+                hits += int((pred == tgt_ids).sum().item())
+                total += int(tgt_ids.numel())
+        if total > 0:
+            result["eval/contrast_hit1"] = float(hits / total)
 
     return result
 
@@ -545,7 +614,29 @@ def main(cfg: DictConfig) -> None:
                 raise FileNotFoundError(f"training.projector_ckpt not found: {proj_ckpt}")
             model.eeg_projector.load_state_dict(torch.load(proj_ckpt, map_location="cpu"))
 
-    # Freeze everything except eeg_projector / qformer (if enabled)
+    # Contrastive head (optional)
+    contrast_cfg = cfg.get("contrastive", {})
+    contrast_enabled = bool(contrast_cfg.get("enabled", False))
+    contrast_only = bool(contrast_cfg.get("only", False))
+    contrast_weight = float(contrast_cfg.get("weight", 1.0))
+    contrast_temp = float(contrast_cfg.get("temperature", 0.07))
+    contrast_all_gather = bool(contrast_cfg.get("use_all_gather", True))
+
+    contrast_proj = None
+    if contrast_enabled:
+        from torch import nn as _nn
+        thinker_cfg = getattr(model.thinker, "config", None)
+        thinker_hidden = getattr(getattr(thinker_cfg, "text_config", thinker_cfg), "hidden_size", None)
+        thinker_hidden = int(thinker_hidden or model.thinker.config.hidden_size)
+        contrast_proj = _nn.Linear(thinker_hidden, 512).to(device=device, dtype=torch.float32)
+        proj_ckpt = str(contrast_cfg.get("proj_ckpt", "")).strip()
+        if proj_ckpt:
+            if not os.path.isfile(proj_ckpt):
+                raise FileNotFoundError(f"contrastive.proj_ckpt not found: {proj_ckpt}")
+            contrast_proj.load_state_dict(torch.load(proj_ckpt, map_location="cpu"))
+        model.eeg_contrast_proj = contrast_proj
+
+    # Freeze everything except eeg_projector / qformer / contrast_proj (if enabled)
     for p in model.parameters():
         p.requires_grad = False
 
@@ -561,6 +652,11 @@ def main(cfg: DictConfig) -> None:
         model.eeg_projector = model.eeg_projector.to(device=device, dtype=torch.float32)
         params_to_train += list(model.eeg_projector.parameters())
 
+    if contrast_enabled and contrast_proj is not None:
+        for p in contrast_proj.parameters():
+            p.requires_grad = True
+        params_to_train += list(contrast_proj.parameters())
+
     # Wrap qformer or eeg_projector with DDP if distributed
     if is_dist:
         from torch.nn.parallel import DistributedDataParallel as DDP
@@ -574,6 +670,13 @@ def main(cfg: DictConfig) -> None:
         else:
             model.eeg_projector = DDP(
                 model.eeg_projector,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
+        if contrast_enabled and contrast_proj is not None:
+            model.eeg_contrast_proj = DDP(
+                contrast_proj,
                 device_ids=[local_rank],
                 output_device=local_rank,
                 find_unused_parameters=False,
@@ -643,6 +746,13 @@ def main(cfg: DictConfig) -> None:
 
     warn_no_caption = True
 
+    all_text_vectors_gpu = None
+    if contrast_enabled:
+        try:
+            all_text_vectors_gpu = train_ds.all_text_vectors.to(device)
+        except Exception:
+            all_text_vectors_gpu = None
+
     if eval_only:
         if val_loader is not None and (not is_dist or _is_rank0(rank)):
             all_text_vectors_cpu = getattr(val_loader.dataset, "all_text_vectors", None)
@@ -654,6 +764,7 @@ def main(cfg: DictConfig) -> None:
                 val_loader=val_loader,
                 eeg_tok_id=eeg_tok_id,
                 all_text_vectors_cpu=all_text_vectors_cpu,
+                contrastive_proj=(contrast_proj if contrast_enabled else None),
             )
             print(f"[Stage-2] eval-only: {eval_metrics}")
         if is_dist:
@@ -676,7 +787,8 @@ def main(cfg: DictConfig) -> None:
 
         for batch in it:
             eeg = batch[0].to(device)
-            target_ids = batch[3].cpu().tolist() if len(batch) >= 4 else [0] * int(eeg.shape[0])
+            target_ids_t = batch[3].to(device) if len(batch) >= 4 else None
+            target_ids = target_ids_t.cpu().tolist() if target_ids_t is not None else [0] * int(eeg.shape[0])
             captions = batch[4] if len(batch) >= 5 else None
             if captions is None:
                 if warn_no_caption and (not is_dist or _is_rank0(rank)):
@@ -722,13 +834,34 @@ def main(cfg: DictConfig) -> None:
                     eeg_embed_h = model.qformer(kv, return_sequence=False)
                 else:
                     eeg_embed_h = model.eeg_projector(emb_txt)  # [B, H], trainable
-                out = model(
-                    input_ids=input_ids,
-                    attention_mask=attn,
-                    labels=labels,
-                    eeg_embeds=eeg_embed_h,
-                )
-                loss = out.loss / max(1, grad_accum)
+                lm_loss = None
+                if not contrast_only:
+                    out = model(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        labels=labels,
+                        eeg_embeds=eeg_embed_h,
+                    )
+                    lm_loss = out.loss
+
+                contrast_loss = None
+                if contrast_enabled and contrast_proj is not None and all_text_vectors_gpu is not None and target_ids_t is not None:
+                    proj_module = contrast_proj.module if hasattr(contrast_proj, "module") else contrast_proj
+                    eeg_feat = proj_module(eeg_embed_h.float())
+                    contrast_loss = _contrastive_loss(
+                        eeg_feat=eeg_feat,
+                        target_ids=target_ids_t,
+                        all_text_vectors=all_text_vectors_gpu,
+                        temperature=contrast_temp,
+                        use_all_gather=contrast_all_gather,
+                    )
+
+                total = 0.0
+                if lm_loss is not None:
+                    total = total + lm_loss
+                if contrast_loss is not None:
+                    total = total + contrast_weight * contrast_loss
+                loss = total / max(1, grad_accum)
 
             scaler.scale(loss).backward()
 
@@ -769,6 +902,7 @@ def main(cfg: DictConfig) -> None:
                 val_loader=val_loader,
                 eeg_tok_id=eeg_tok_id,
                 all_text_vectors_cpu=all_text_vectors_cpu,
+                contrastive_proj=(contrast_proj if contrast_enabled else None),
             )
             print(f"[Stage-2] eval: {eval_metrics}")
 
@@ -794,6 +928,13 @@ def main(cfg: DictConfig) -> None:
                     proj = model.eeg_projector.module if hasattr(model.eeg_projector, "module") else model.eeg_projector
                     torch.save(proj.state_dict(), best_path)
                     print(f"[Stage-2] Saved best_eeg_projector to: {best_path} ({selection_metric}={best_score:.6f})")
+                if contrast_enabled and contrast_proj is not None:
+                    save_contrast = bool(contrast_cfg.get("save_proj", True))
+                    if save_contrast:
+                        cproj = contrast_proj.module if hasattr(contrast_proj, "module") else contrast_proj
+                        contrast_path = out_dir / "best_eeg_contrast_proj.pth"
+                        torch.save(cproj.state_dict(), contrast_path)
+                        print(f"[Stage-2] Saved best_eeg_contrast_proj to: {contrast_path}")
             else:
                 bad_epochs += 1
                 if patience > 0 and bad_epochs >= patience:

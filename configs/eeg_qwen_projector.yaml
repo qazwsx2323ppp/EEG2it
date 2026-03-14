@@ -64,6 +64,15 @@ qformer:
   dropout: 0.1
   resid_scale: 0.5
 
+contrastive:
+  enabled: false
+  weight: 1.0
+  temperature: 0.07
+  use_all_gather: true
+  only: false
+  proj_ckpt: ""
+  save_proj: true
+
 prompt:
   eeg_token: "<EEG>"
   instruction: "Generate a concise Stable Diffusion prompt for the image described by the brain signal."

@@ -346,6 +346,10 @@ class TripletDataset(Dataset):
         self.captions_dir = str(_safe_getattr(cfg_data, "captions_dir", "") or "").strip()
         self.captions_pattern = str(_safe_getattr(cfg_data, "captions_pattern", "{image_id}.txt") or "{image_id}.txt")
         self.captions_encoding = str(_safe_getattr(cfg_data, "captions_encoding", "utf-8") or "utf-8")
+self.captions_use_eeg_images = bool(_safe_getattr(cfg_data, "captions_use_eeg_images", False))
+self.captions_suffix = str(_safe_getattr(cfg_data, "captions_suffix", "_caption") or "_caption")
+self.captions_ext = str(_safe_getattr(cfg_data, "captions_ext", ".txt") or ".txt")
+self.captions_subdir = bool(_safe_getattr(cfg_data, "captions_subdir", True))
 
         # ---- ds003825 (BIDS) backend ----
         # 用法：把 cfg.data.eeg_path 指向 BIDS 根目录（包含 dataset_description.json），并提供 concept 级别向量：
@@ -458,6 +462,7 @@ class TripletDataset(Dataset):
         try:
             eeg_loaded_data = torch.load(cfg_data.eeg_path)
             self.all_eeg_items = eeg_loaded_data['dataset']
+self.eeg_images = eeg_loaded_data.get('images', None)
             if _is_rank0():
                 print(f"成功从 {cfg_data.eeg_path} 加载了 'dataset' 列表，包含 {len(self.all_eeg_items)} 个条目。")
         except KeyError:
@@ -529,6 +534,26 @@ class TripletDataset(Dataset):
             return raw.strip()
         if not self.captions_dir:
             return ""
+        if self.captions_use_eeg_images and isinstance(getattr(self, 'eeg_images', None), list):
+            if 0 <= int(image_id) < len(self.eeg_images):
+                base = str(self.eeg_images[int(image_id)])
+                syn = base.split('_')[0] if '_' in base else ''
+                suffix = str(self.captions_suffix)
+                ext = str(self.captions_ext)
+                if suffix.endswith(ext):
+                    fname = f"{base}{suffix}"
+                else:
+                    fname = f"{base}{suffix}{ext}"
+                if self.captions_subdir and syn:
+                    path = os.path.join(self.captions_dir, syn, fname)
+                else:
+                    path = os.path.join(self.captions_dir, fname)
+                if os.path.isfile(path):
+                    try:
+                        with open(path, 'r', encoding=self.captions_encoding) as f:
+                            return f.read().strip()
+                    except Exception:
+                        return ''
         try:
             fname = self.captions_pattern.format(
                 image_id=int(image_id),

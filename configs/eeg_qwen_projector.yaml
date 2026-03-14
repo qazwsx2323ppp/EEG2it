@@ -20,6 +20,11 @@ data:
   # Default pattern is "{image_id}.txt" and will be formatted with image_id/image/label/subject.
   captions_dir: ${data.root}/data/text_data
   captions_pattern: "{image_id}.txt"
+  # Use eeg.pth `images` list to locate caption files (ImageNet-style names)
+  captions_use_eeg_images: false
+  captions_suffix: "_caption"
+  captions_ext: ".txt"
+  captions_subdir: true
 
 stage1:
   # Path to your trained EEG encoder weights (best_eeg_encoder.pth from main.py)

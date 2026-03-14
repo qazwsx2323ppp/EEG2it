@@ -537,6 +537,14 @@ def main(cfg: DictConfig) -> None:
         model.qformer = qformer
         model.use_qformer = True
 
+    # Optionally load pretrained projector when not using Q-Former
+    if not use_qformer:
+        proj_ckpt = str(cfg.training.get("projector_ckpt", "")).strip()
+        if proj_ckpt:
+            if not os.path.isfile(proj_ckpt):
+                raise FileNotFoundError(f"training.projector_ckpt not found: {proj_ckpt}")
+            model.eeg_projector.load_state_dict(torch.load(proj_ckpt, map_location="cpu"))
+
     # Freeze everything except eeg_projector / qformer (if enabled)
     for p in model.parameters():
         p.requires_grad = False
@@ -631,8 +639,28 @@ def main(cfg: DictConfig) -> None:
     epochs = int(cfg.training.get("epochs", 1))
     log_every = int(cfg.training.get("log_every", 50))
     max_steps = int(cfg.training.get("max_train_steps", 0))
+    eval_only = bool(cfg.training.get("eval_only", False))
 
     warn_no_caption = True
+
+    if eval_only:
+        if val_loader is not None and (not is_dist or _is_rank0(rank)):
+            all_text_vectors_cpu = getattr(val_loader.dataset, "all_text_vectors", None)
+            eval_metrics = _evaluate_generation(
+                cfg=cfg,
+                model=model,
+                tokenizer=tokenizer,
+                eeg_encoder=eeg_encoder,
+                val_loader=val_loader,
+                eeg_tok_id=eeg_tok_id,
+                all_text_vectors_cpu=all_text_vectors_cpu,
+            )
+            print(f"[Stage-2] eval-only: {eval_metrics}")
+        if is_dist:
+            import torch.distributed as dist
+            dist.barrier()
+            dist.destroy_process_group()
+        return
 
     for epoch in range(epochs):
         if train_sampler is not None:

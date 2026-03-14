@@ -84,12 +84,16 @@ training:
   warmup_steps: 0
   max_grad_norm: 0.0
   target_cache_max: 50000
+  # Optional: load a pretrained projector for eval-only or resume (when qformer disabled)
+  projector_ckpt: ""
   # Model selection for saving best projector
   selection_metric: "eval/clip_hit1"
   selection_mode: "max"
   min_delta: 0.0
   # Early stopping on selection_metric (0 disables)
   early_stop_patience: 0
+  # Eval-only mode (skip training loop)
+  eval_only: false
   # Set >0 to cap total steps for quick tests
   max_train_steps: 0
 

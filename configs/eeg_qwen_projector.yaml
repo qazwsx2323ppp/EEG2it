@@ -18,7 +18,7 @@ data:
   return_caption: true
   # If captions are stored in a separate folder, provide it here.
   # Default pattern is "{image_id}.txt" and will be formatted with image_id/image/label/subject.
-  captions_dir: ${data.root}/data/text_data
+  captions_dir: /media/wsqlab/data/ctp_file/EEG2it/data/text_data
   captions_pattern: "{image_id}.txt"
   # Use eeg.pth `images` list to locate caption files (ImageNet-style names)
   captions_use_eeg_images: false

@@ -125,22 +125,37 @@ class _BatchText:
     labels: "torch.Tensor"
 
 
-def _build_teacher_forcing_batch(tokenizer, eeg_token: str, instruction: str, targets: list[str], max_length: int) -> _BatchText:
+def _build_teacher_forcing_batch(
+    tokenizer,
+    eeg_token: str,
+    instruction: str,
+    targets: list[str],
+    max_length: int,
+    *,
+    prefix_ids: Optional[list[int]] = None,
+    target_cache: Optional[dict[str, list[int]]] = None,
+) -> _BatchText:
     import torch
 
     eos_id = _tokenizer_eos_id(tokenizer)
     if eos_id is None:
         raise RuntimeError("Tokenizer has no eos_token_id/sep_token_id/pad_token_id; cannot build labels safely.")
 
-    prefix_text = f"{eeg_token} {instruction}".strip() + "\n"
-    prefix_ids = tokenizer(prefix_text, add_special_tokens=False).input_ids
+    if prefix_ids is None:
+        prefix_text = f"{eeg_token} {instruction}".strip() + "\n"
+        prefix_ids = tokenizer(prefix_text, add_special_tokens=False).input_ids
 
     all_input_ids: list[list[int]] = []
     all_labels: list[list[int]] = []
 
     for t in targets:
         t = (t or "").strip()
-        tgt_ids = tokenizer(t, add_special_tokens=False).input_ids
+        if target_cache is not None and t in target_cache:
+            tgt_ids = target_cache[t]
+        else:
+            tgt_ids = tokenizer(t, add_special_tokens=False).input_ids
+            if target_cache is not None:
+                target_cache[t] = tgt_ids
         if eos_id is not None:
             tgt_ids = tgt_ids + [eos_id]
 
@@ -369,6 +384,14 @@ def main(cfg: DictConfig) -> None:
     else:
         device = torch.device(str(cfg.training.get("device", "cuda")))
 
+    # Optional TF32 (only effective on Ampere+)
+    if bool(cfg.training.get("use_tf32", False)):
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
     # ---- Data ----
     split_index = int(cfg.data.get("split_index", 0))
     train_ds = TripletDataset(cfg.data, mode="train", split_index=split_index)
@@ -547,6 +570,27 @@ def main(cfg: DictConfig) -> None:
         weight_decay=float(cfg.training.get("weight_decay", 0.0)),
     )
 
+    # Scheduler (optional)
+    sched = None
+    sched_type = str(cfg.training.get("lr_scheduler", "none")).lower()
+    warmup_steps = int(cfg.training.get("warmup_steps", 0))
+    if sched_type in {"linear", "cosine"}:
+        try:
+            from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+        except Exception:
+            get_linear_schedule_with_warmup = None
+            get_cosine_schedule_with_warmup = None
+
+        if get_linear_schedule_with_warmup or get_cosine_schedule_with_warmup:
+            steps_per_epoch = len(train_loader)
+            total_steps = steps_per_epoch * int(cfg.training.get("epochs", 1))
+            if int(cfg.training.get("max_train_steps", 0)) > 0:
+                total_steps = min(total_steps, int(cfg.training.get("max_train_steps", 0)))
+            if sched_type == "linear" and get_linear_schedule_with_warmup:
+                sched = get_linear_schedule_with_warmup(optim, warmup_steps, total_steps)
+            elif sched_type == "cosine" and get_cosine_schedule_with_warmup:
+                sched = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
+
     use_amp = bool(cfg.training.get("amp", True))
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     grad_accum = int(cfg.training.get("grad_accum_steps", 1))
@@ -554,12 +598,18 @@ def main(cfg: DictConfig) -> None:
     instruction = str(cfg.prompt.get("instruction", "Generate a concise Stable Diffusion prompt."))
     target_template = str(cfg.prompt.get("target_template", "{caption}"))
     max_length = int(cfg.prompt.get("max_length", 128))
+    prefix_text = f"{eeg_token} {instruction}".strip() + "\n"
+    prefix_ids = tokenizer(prefix_text, add_special_tokens=False).input_ids
+    target_cache = {}
+    target_cache_max = int(cfg.training.get("target_cache_max", 50000))
 
     out_dir = Path(os.getcwd())
     metrics_path = out_dir / "stage2_metrics.jsonl"
 
     best_score = float("-inf")
     best_path = out_dir / ("best_eeg_qformer.pth" if use_qformer else "best_eeg_projector.pth")
+    bad_epochs = 0
+    patience = int(cfg.training.get("early_stop_patience", 0))
 
     def _append_metrics(obj: dict[str, Any]) -> None:
         if is_dist and not _is_rank0(rank):
@@ -603,12 +653,16 @@ def main(cfg: DictConfig) -> None:
                 cap_s = str(cap or "").strip()
                 targets.append(target_template.format(caption=cap_s, target_id=int(tid)).strip())
 
+            if target_cache_max > 0 and len(target_cache) > target_cache_max:
+                target_cache.clear()
             txt_batch = _build_teacher_forcing_batch(
                 tokenizer,
                 eeg_token=eeg_token,
                 instruction=instruction,
                 targets=targets,
                 max_length=max_length,
+                prefix_ids=prefix_ids,
+                target_cache=target_cache,
             )
             input_ids = txt_batch.input_ids.to(device)
             attn = txt_batch.attention_mask.to(device)
@@ -643,9 +697,15 @@ def main(cfg: DictConfig) -> None:
             scaler.scale(loss).backward()
 
             if (global_step + 1) % grad_accum == 0:
+                max_grad_norm = float(cfg.training.get("max_grad_norm", 0.0))
+                if max_grad_norm and max_grad_norm > 0:
+                    scaler.unscale_(optim)
+                    torch.nn.utils.clip_grad_norm_(params_to_train, max_grad_norm)
                 scaler.step(optim)
                 scaler.update()
                 optim.zero_grad(set_to_none=True)
+                if sched is not None:
+                    sched.step()
 
             running += float(loss.item() * max(1, grad_accum))
             nloss += 1
@@ -682,10 +742,14 @@ def main(cfg: DictConfig) -> None:
         min_delta = float(cfg.training.get("min_delta", 0.0))
 
         if not is_dist or _is_rank0(rank):
-            score = float(eval_metrics.get(selection_metric, -train_loss))
+            if selection_metric in eval_metrics:
+                score = float(eval_metrics.get(selection_metric))
+            else:
+                score = -float(train_loss)
             improved = (score > best_score + min_delta) if selection_mode == "max" else (score < best_score - min_delta)
             if improved:
                 best_score = score
+                bad_epochs = 0
                 if use_qformer and model.qformer is not None:
                     qf = model.qformer.module if hasattr(model.qformer, "module") else model.qformer
                     torch.save(qf.state_dict(), best_path)
@@ -694,6 +758,11 @@ def main(cfg: DictConfig) -> None:
                     proj = model.eeg_projector.module if hasattr(model.eeg_projector, "module") else model.eeg_projector
                     torch.save(proj.state_dict(), best_path)
                     print(f"[Stage-2] Saved best_eeg_projector to: {best_path} ({selection_metric}={best_score:.6f})")
+            else:
+                bad_epochs += 1
+                if patience > 0 and bad_epochs >= patience:
+                    print(f"[Stage-2] Early stopping (patience={patience})")
+                    break
 
         _append_metrics(
             {

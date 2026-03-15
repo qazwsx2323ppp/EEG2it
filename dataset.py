@@ -462,7 +462,7 @@ class TripletDataset(Dataset):
         try:
             eeg_loaded_data = torch.load(cfg_data.eeg_path)
             self.all_eeg_items = eeg_loaded_data['dataset']
-self.eeg_images = eeg_loaded_data.get('images', None)
+            self.eeg_images = eeg_loaded_data.get('images', None)
             if _is_rank0():
                 print(f"成功从 {cfg_data.eeg_path} 加载了 'dataset' 列表，包含 {len(self.all_eeg_items)} 个条目。")
         except KeyError:

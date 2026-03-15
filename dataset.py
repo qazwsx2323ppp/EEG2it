@@ -346,10 +346,10 @@ class TripletDataset(Dataset):
         self.captions_dir = str(_safe_getattr(cfg_data, "captions_dir", "") or "").strip()
         self.captions_pattern = str(_safe_getattr(cfg_data, "captions_pattern", "{image_id}.txt") or "{image_id}.txt")
         self.captions_encoding = str(_safe_getattr(cfg_data, "captions_encoding", "utf-8") or "utf-8")
-self.captions_use_eeg_images = bool(_safe_getattr(cfg_data, "captions_use_eeg_images", False))
-self.captions_suffix = str(_safe_getattr(cfg_data, "captions_suffix", "_caption") or "_caption")
-self.captions_ext = str(_safe_getattr(cfg_data, "captions_ext", ".txt") or ".txt")
-self.captions_subdir = bool(_safe_getattr(cfg_data, "captions_subdir", True))
+        self.captions_use_eeg_images = bool(_safe_getattr(cfg_data, "captions_use_eeg_images", False))
+        self.captions_suffix = str(_safe_getattr(cfg_data, "captions_suffix", "_caption") or "_caption")
+        self.captions_ext = str(_safe_getattr(cfg_data, "captions_ext", ".txt") or ".txt")
+        self.captions_subdir = bool(_safe_getattr(cfg_data, "captions_subdir", True))
 
         # ---- ds003825 (BIDS) backend ----
         # 用法：把 cfg.data.eeg_path 指向 BIDS 根目录（包含 dataset_description.json），并提供 concept 级别向量：

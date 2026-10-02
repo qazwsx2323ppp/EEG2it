@@ -200,7 +200,7 @@ class SpatialMoEEncoder(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x, ablation=None):
+    def forward(self, x, ablation=None, return_details=False):
         # x shape: (batch, channels, samples) 
         # DreamDiffusion 需要 (batch, channels, 512)
         
@@ -309,7 +309,18 @@ class SpatialMoEEncoder(nn.Module):
         #     "w_sem_txt": torch.tensor(1.0, device=x.device)
         # }
         # 返回真实的权重用于监控
-        return final_img_embedding, final_text_embedding, {
+        weights = {
             "w_vis_img": g_vis_img.mean(), 
             "w_sem_txt": g_sem_txt.mean()
         }
+        if return_details:
+            weights.update({
+                "emb_visual": emb_vis,
+                "emb_semantic": emb_sem,
+                "emb_shared": emb_fus,
+                "gate_visual_img": g_vis_img,
+                "gate_shared_img": g_fus_img,
+                "gate_semantic_txt": g_sem_txt,
+                "gate_shared_txt": g_fus_txt,
+            })
+        return final_img_embedding, final_text_embedding, weights
